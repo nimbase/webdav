@@ -1,26 +1,168 @@
 <p align="center">
-  A starter template for creating Nim wrappers<br>
+  <strong>webdav</strong><br>
+  WebDAV Class 1 + 2 and CalDAV core for Nim<br>
+  Made with the PowPow event library
 </p>
 
 <p align="center">
-  <code>nimble install {nimbase-pkg-name}</code>
+  <code>nimble install webdav</code>
 </p>
 
 <p align="center">
-  <a href="https://nimbase.github.io/{nimbase-repo-name}/">API reference</a><br>
-  <img src="https://github.com/nimbase/{nimbase-repo-name}/workflows/test/badge.svg" alt="Github Actions">  <img src="https://github.com/nimbase/{nimbase-repo-name}/workflows/docs/badge.svg" alt="Github Actions">
+  <a href="https://nimbase.github.io/webdav/">API reference</a><br>
+  <img src="https://github.com/nimbase/webdav/workflows/test/badge.svg" alt="Github Actions">  <img src="https://github.com/nimbase/webdav/workflows/docs/badge.svg" alt="Github Actions">
 </p>
 
+WebDAV file sharing plus calendar hosting in one embeddable server.
+It runs on [PowPow](https://github.com/nimbase/powpow) (async event loop,
+HTTP/1 + HTTP/2), stores data through any
+[flysystem](https://github.com/nimbase/supranim-packages) driver, and parses
+iCalendar via [openparser](https://github.com/openpeeps/openparser).
+The extra HTTP verbs (`PROPFIND`, `LOCK`, `REPORT`, ...) are registered at
+compile time through [voodoo](https://github.com/nimbase/voodoo) extensible
+enums, so `powpow` itself stays generic.
+
+> Import rule: `import webdav` must come before any direct `import powpow`,
+> so the DAV verbs are staged before powPow compiles.
 
 ## Features
-{nimbase-repo-features}
+
+**WebDAV Class 1 (RFC 4918)**
+
+- `OPTIONS` (advertises `DAV: 1, 2`), `GET`, `HEAD`, `PUT`, `DELETE`
+- `MKCOL`, `PROPFIND` (`allprop`/`propname`/`prop`), best-effort `PROPPATCH`
+- `COPY` / `MOVE` with `Destination` + `Overwrite` handling
+- Live properties (`resourcetype`, `getetag`, `getcontentlength`,
+  `displayname`, `getlastmodified`, ...) and namespaced dead properties
+  that round-trip and travel across `COPY`/`MOVE`
+- Hardened XML input (depth and node caps, `422` on malformed bodies)
+
+**WebDAV Class 2 locking (RFC 4918)**
+
+- `LOCK` / `UNLOCK` with exclusive and shared scopes, depth `0`/`infinity`
+- `Timeout`, `Lock-Token`, and an `If` header subset (untagged + tagged
+  groups, `Not`)
+- `423 Locked` enforcement on modifying methods, live `lockdiscovery`
+
+**CalDAV core (RFC 4791)**
+
+- `MKCALENDAR` with optional `<set><prop>` defaults
+- `REPORT` `calendar-query` (comp-filter + `time-range`) and
+  `calendar-multiget`, returning `getetag` + `calendar-data`
+- Recurrence expansion subset (`DAILY`/`WEEKLY`/`MONTHLY`/`YEARLY`,
+  `INTERVAL`, `COUNT`, `UNTIL`, weekly `BYDAY`, `EXDATE`)
+- `PUT` gate: resources inside a calendar must hold iCalendar object data
+- `getctag` change tags and `supported-report-set` on calendars
+
+**Plumbing**
+
+- Any flysystem `StorageDriver` backend (`LocalDriver` on disk,
+  `MemoryDriver` for tests)
+- Single-loop friendly: lazy lock expiry, no background threads
 
 ## Examples
-{nimbase-repo-examples}
+
+### Run the example server
+
+```sh
+clue build examples/dav_server.nim --out:bin/dav_server
+./bin/dav_server ./davroot 9001   # args optional, these are the defaults
+```
+
+### Talk to it with curl
+
+```sh
+# Class 1: upload and inspect
+curl -X PUT http://localhost:9001/hello.txt -d 'hi' -i
+curl -X PROPFIND http://localhost:9001/ -H 'Depth: 1' -i
+
+# Locking: lock, fail without a token, succeed with one
+TOK=$(curl -s -i -X LOCK http://localhost:9001/hello.txt \
+  -H 'Depth: 0' -H 'Content-Type: application/xml' \
+  -d '<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>' \
+  | grep -o 'Lock-Token: <[^>]*>')
+curl -X PUT http://localhost:9001/hello.txt -d 'no' -i            # 423
+curl -X PUT http://localhost:9001/hello.txt -d 'yes' -H "If: (<${TOK#Lock-Token: <})" -i
+
+# CalDAV: calendar, event, time-range query
+curl -X MKCALENDAR http://localhost:9001/cal -i
+curl -X PUT http://localhost:9001/cal/ev.ics -H 'Content-Type: text/calendar' \
+  -d 'BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Example//EN
+BEGIN:VEVENT
+UID:ev1
+DTSTAMP:20260101T000000Z
+DTSTART:20260105T100000Z
+DTEND:20260105T110000Z
+SUMMARY:Hi
+END:VEVENT
+END:VCALENDAR' -i
+curl -X REPORT http://localhost:9001/cal -H 'Depth: 1' \
+  -H 'Content-Type: application/xml' \
+  -d '<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:prop><D:getetag/><C:calendar-data/></D:prop><C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT"><C:time-range start="20260105T000000Z" end="20260106T000000Z"/></C:comp-filter></C:comp-filter></C:filter></C:calendar-query>' -i
+```
+
+### Embed it in your app
+
+```nim
+import webdav  # before powpow, see the import rule above
+
+let srv = newDavServer(newLocalDriver("./davroot"))
+newHttpServer().start(srv.davHandler(), Port(9001))
+```
+
+Use `newMemoryDriver()` instead of `newLocalDriver()` for tests (see
+`tests/t_server_mem.nim` for the loopback pattern).
+
+## Modules
+
+| Module | Job |
+|---|---|
+| `webdav/davmethod` | Compile-time verb registration (`PROPFIND` … `REPORT`, `MKCALENDAR`) |
+| `webdav/types` | Shared DAV types |
+| `webdav/davxml` | Hardened DAV XML parsing + `multistatus` builder |
+| `webdav/backend` | flysystem pairing, dead props, calendar markers |
+| `webdav/props` | Live property computation |
+| `webdav/locks` | Lock manager, `Timeout`/`If` parsing |
+| `webdav/caldav` | REPORT parsing, time-range + recurrence matching |
+| `webdav/server` | Request router (`DavServer`, `davHandler`) |
+
+## Tests
+
+```sh
+clue build tests/t_davmethod.nim  --out:/tmp/t_davmethod  && /tmp/t_davmethod
+clue build tests/t_davxml.nim     --out:/tmp/t_davxml     && /tmp/t_davxml
+clue build tests/t_locks.nim      --out:/tmp/t_locks      && /tmp/t_locks
+clue build tests/t_server_mem.nim --out:/tmp/t_server_mem && /tmp/t_server_mem
+clue build tests/t_caldav.nim     --out:/tmp/t_caldav     && /tmp/t_caldav
+```
+
+61 checks total across unit suites and loopback servers (in-memory backend
+plus live curl runs against the disk-backed example).
+
+## Known limits
+
+- `Depth: infinity` on `PROPFIND` is capped to depth 1
+- `PROPPATCH` applies best-effort in order (no atomic all-or-nothing)
+- `If` evaluation is a subset (`Not` supported, etag conditions ignored)
+- No auth or principal model yet (any valid lock token satisfies a lock)
+- `GET` on a collection answers `403` (no HTML listing view)
+- Recurrence and timezone handling follow the documented subset in
+  `src/webdav/caldav.nim` (clamped month overflow, UTC-normalized times)
+
+## Roadmap
+
+- [ ] WebDAV client to match the server
+- [ ] CardDAV (blocked upstream: `openparser` has no vCard parser yet)
+- [ ] CalDAV scheduling and `free-busy-query` REPORTs
+- [ ] Auth + principal collections (`calendar-home-set`, `current-user-principal`)
+- [ ] Full `Depth: infinity` and atomic `PROPPATCH`
+- [ ] Collection listing view for `GET`
 
 ### ❤ Contributions & Support
-- 🐛 Found a bug? [Create a new Issue](https://github.com/nimbase/{nimbase-repo-name}/issues)
-- 👋 Wanna help? [Fork it!](https://github.com/nimbase/{nimbase-repo-name}/fork)
+- 🐛 Found a bug? [Create a new Issue](https://github.com/nimbase/webdav/issues)
+- 👋 Wanna help? [Fork it!](https://github.com/nimbase/webdav/fork)
 
 ### 🎩 License
 MIT license | Nim Community.
