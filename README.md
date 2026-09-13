@@ -1,6 +1,6 @@
 <p align="center">
   <strong>webdav</strong><br>
-  WebDAV Class 1 + 2 and CalDAV core for Nim<br>
+  WebDAV Class 1 + 2 and CalDAV/CardDAV core for Nim<br>
   Made with the PowPow event library
 </p>
 
@@ -59,11 +59,16 @@ enums, so `powpow` itself stays generic.
 - Extended `MKCOL` with `<resourcetype><collection/><addressbook/></resourcetype>`
   creates addressbook collections (plain `MKCOL` unchanged, `415` for other bodies)
 - `REPORT` `addressbook-query` (`prop-filter` + `param-filter` + `text-match` +
-  `is-not-defined`, `test="anyof|allof"`, `negate-condition`, `limit/nresults`)
-  and `addressbook-multiget`, returning `getetag` + `address-data`
-- `PUT` gate: resources inside an addressbook must hold vCard object data
+  `is-not-defined`, `test="anyof|allof"`, `negate-condition`, `limit/nresults`),
+  `addressbook-multiget`, and `sync-collection` (RFC 6578, ctag-based tokens),
+  returning `getetag` + `address-data`
+- `address-data` negotiation: `version="3.0"` downgrades via openparser,
+  other `content-type` than `text/vcard` answers `415`
+- `PUT`/`COPY`/`MOVE` gates: exactly one vCard per resource, UID uniqueness
+  (`409` on reuse or UID change)
 - `getctag` change tags, `supported-report-set` and `supported-address-data`
   on addressbooks, `addressbook-description` dead-prop default via extended `MKCOL`
+- `GET` on `.vcf` serves `text/vcard`
 
 **Plumbing**
 
@@ -71,17 +76,17 @@ enums, so `powpow` itself stays generic.
   `MemoryDriver` for tests)
 - Single-loop friendly: lazy lock expiry, no background threads
 
-**Client (RFC 4918 + CalDAV reports)**
+**Client (RFC 4918 + CalDAV/CardDAV reports)**
 
 - `DavClient` over powpow's sync `HttpClient`: one helper per verb
   (`propfind`, `proppatch`, `mkcol`, `mkcolAddressbook`, `mkcalendar`, `copy`,
   `move`, `lock`, `unlock`, `report`, plus plain `get`/`put`/`delete`)
 - Request builders (`buildPropertyupdate`, `buildLockinfo`,
   `buildCalendarQuery`, `buildCalendarMultiget`, `buildAddressbookQuery`,
-  `buildAddressbookMultiget`, `buildMkcolAddressbook`) that round-trip through
-  the server parsers
+  `buildAddressbookMultiget`, `buildMkcolAddressbook`, `buildSyncCollection`)
+  that round-trip through the server parsers
 - Response helpers: `multistatus` parsing into `DavResponse`s,
-  `propstatCode`, `lockTokenOf`, `ensure` for status assertions
+  `syncTokenOf`, `propstatCode`, `lockTokenOf`, `ensure` for status assertions
 
 ## Examples
 
@@ -174,7 +179,7 @@ dav.closeClient()
 | `webdav/davmethod` | Compile-time verb registration (`PROPFIND` … `REPORT`, `MKCALENDAR`) |
 | `webdav/types` | Shared DAV types |
 | `webdav/davxml` | Hardened DAV XML parsing + `multistatus` builder |
-| `webdav/backend` | flysystem pairing, dead props, calendar markers |
+| `webdav/backend` | flysystem pairing, dead props, calendar/addressbook markers |
 | `webdav/props` | Live property computation |
 | `webdav/locks` | Lock manager, `Timeout`/`If` parsing |
 | `webdav/caldav` | REPORT parsing, time-range + recurrence matching |
@@ -194,7 +199,7 @@ clue build tests/t_carddav.nim    --out:/tmp/t_carddav    && /tmp/t_carddav
 clue build tests/t_client.nim     --out:/tmp/t_client     && /tmp/t_client
 ```
 
-360+ checks total across unit suites and loopback servers (in-memory backend
+440+ checks total across unit suites and loopback servers (in-memory backend
 plus live curl runs against the disk-backed example).
 
 ## Known limits
@@ -206,9 +211,11 @@ plus live curl runs against the disk-backed example).
 - `GET` on a collection answers `403` (no HTML listing view)
 - Recurrence and timezone handling follow the documented subset in
   `src/webdav/caldav.nim` (clamped month overflow, UTC-normalized times)
-- CardDAV filter handling follows the documented subset in
-  `src/webdav/carddav.nim` (`address-data` preferences ignored, multi-card
-  resources accepted leniently, no `principal-property-search`/`sync-collection`/ACLs yet)
+- CardDAV handling follows the documented subset in
+  `src/webdav/carddav.nim` (UID presence not required but unique when present,
+  unknown `address-data` versions fall back to stored bytes,
+  `sync-collection` keeps no delete tombstones so deletions surface as a full
+  resync, no `principal-property-search`/ACLs yet)
 
 ## Roadmap
 

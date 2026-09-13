@@ -6,9 +6,11 @@
 #   The `<set><prop>` defaults are stored best-effort as dead props;
 #   protected live props in the body are rejected with `403`.
 # - REPORT supports `addressbook-query` (prop-filter + param-filter +
-#   text-match + is-not-defined) and `addressbook-multiget` (href list).
-#   Both honor the `<prop>` selector: `getetag` and `address-data` plus any
-#   other requested live/dead prop.
+#   text-match + is-not-defined), `addressbook-multiget` (href list) and
+#   `sync-collection` (RFC 6578, ctag-based tokens; no delete tombstones,
+#   so a stale or unknown token answers with a full member listing).
+#   Query and multiget honor the `<prop>` selector: `getetag` and
+#   `address-data` plus any other requested live/dead prop.
 # - text-match collations: `i;unicode-casemap` (default, case-insensitive),
 #   `i;ascii-casemap`, `i;octet` (byte-exact). match-types: `contains`
 #   (default), `equals`, `starts-with`, `ends-with`. `negate-condition="yes"`
@@ -20,10 +22,13 @@
 #   are visible to param-filters only. Groups (`item1.TEL`) are ignored for
 #   matching (values still match). `X-` / unknown props in `extraProps`
 #   participate under their literal names.
-# - `address-data` `content-type`/`version` preferences are accepted but
-#   ignored: the server always returns the stored `text/vcard` bytes.
-# - PUT into an addressbook requires vCard object data (at least one card
-#   with non-empty `FN`); multi-card resources are accepted leniently.
+# - `address-data` `content-type`/`version` preferences are honored:
+#   `version="3.0"` downgrades the returned card via openparser,
+#   `version="4.0"` (or absent) returns 4.0 form; a `content-type` other
+#   than `text/vcard` (or absent) answers `415`. Unknown `version` values
+#   fall back to the stored bytes.
+# - PUT into an addressbook requires exactly one vCard with non-empty `FN`
+#   (RFC 6352 §6.3: one address object per resource).
 
 import std/[strutils, tables, options, unicode]
 import pkg/openparser/vcard
@@ -60,14 +65,36 @@ type
     textMatches*: seq[CardTextMatch]
     paramFilters*: seq[CardParamFilter]
 
+  CardAddressDataPref* = object
+    ## One requested `<address-data>` element's preferences, as sent.
+    contentType*: string ## e.g. `text/vcard`; "" when absent.
+    version*: string     ## e.g. `3.0`; "" when absent.
+
   CardReportRequest* = object
     kind*: CardReportKind
     hrefs*: seq[string]
     wantEtag*: bool
     wantAddressData*: bool
+    addressDataPrefs*: seq[CardAddressDataPref]
+    hasUnsupportedAddressData*: bool ## A non-`text/vcard` content-type
+      ## was requested; the server answers the REPORT with `415`.
     extraProps*: seq[string]
     filters*: seq[CardPropFilter]
     testAnyOf*: bool ## top-level `<filter test="">`.
+    hasLimit*: bool
+    limit*: int
+
+  SyncCollectionRequest* = object
+    ## RFC 6578 `sync-collection` REPORT. The root element lives in the
+    ## DAV: namespace (`<D:sync-collection>`), not CardDAV's.
+    token*: string
+    hasToken*: bool
+    infinite*: bool ## `sync-level` was `infinite` (behaves as Depth 1 here).
+    wantEtag*: bool
+    wantAddressData*: bool
+    addressDataPrefs*: seq[CardAddressDataPref]
+    hasUnsupportedAddressData*: bool
+    extraProps*: seq[string]
     hasLimit*: bool
     limit*: int
 
@@ -196,6 +223,36 @@ proc parseCardPropFilter(node: XmlNode): CardPropFilter =
     raise newException(DavXmlError,
       "prop-filter cannot combine is-not-defined with other tests")
 
+proc parseCardPropSelector(prop: XmlNode, wantEtag, wantAddressData: var bool,
+    prefs: var seq[CardAddressDataPref], hasUnsupported: var bool,
+    extraProps: var seq[string]) =
+  ## Shared `<prop>` selector for query, multiget and sync-collection:
+  ## `getetag`, `address-data` (with `content-type`/`version` preferences)
+  ## plus any other requested live/dead prop.
+  for c in prop.elementChildren():
+    case localName(c.tag)
+    of "getetag": wantEtag = true
+    of "address-data":
+      wantAddressData = true
+      let ct = attrOf(c, "content-type").strip()
+      let v = attrOf(c, "version").strip()
+      prefs.add(CardAddressDataPref(contentType: ct, version: v))
+      if ct.len > 0 and ct.toLowerAscii() != "text/vcard":
+        hasUnsupported = true
+    else: extraProps.add(localName(c.tag))
+
+proc parseCardLimit(root: XmlNode, hasLimit: var bool, limit: var int) =
+  let lim = root.findChild("limit")
+  if lim != nil:
+    let n = lim.findChild("nresults")
+    if n == nil:
+      raise newException(DavXmlError, "limit needs nresults")
+    try:
+      limit = max(parseInt(nodeText(n).strip()), 0)
+      hasLimit = true
+    except ValueError:
+      raise newException(DavXmlError, "bad nresults value")
+
 proc parseCardReport*(body: string): CardReportRequest =
   ## Parse an `addressbook-query` or `addressbook-multiget` REPORT body.
   ## Raises `DavXmlError` on any failure.
@@ -215,11 +272,9 @@ proc parseCardReport*(body: string): CardReportRequest =
   let prop = root.findChild("prop")
   if prop == nil:
     raise newException(DavXmlError, "REPORT needs a prop child")
-  for c in prop.elementChildren():
-    case localName(c.tag)
-    of "getetag": result.wantEtag = true
-    of "address-data": result.wantAddressData = true
-    else: result.extraProps.add(localName(c.tag))
+  parseCardPropSelector(prop, result.wantEtag, result.wantAddressData,
+    result.addressDataPrefs, result.hasUnsupportedAddressData,
+    result.extraProps)
   if result.kind == rkAddressMultiget:
     for h in root.childrenByLocal("href"):
       let v = nodeText(h).strip()
@@ -227,16 +282,7 @@ proc parseCardReport*(body: string): CardReportRequest =
         result.hrefs.add(v)
     if result.hrefs.len == 0:
       raise newException(DavXmlError, "addressbook-multiget needs hrefs")
-    let limit = root.findChild("limit")
-    if limit != nil:
-      let n = limit.findChild("nresults")
-      if n == nil:
-        raise newException(DavXmlError, "limit needs nresults")
-      try:
-        result.limit = max(parseInt(nodeText(n).strip()), 0)
-        result.hasLimit = true
-      except ValueError:
-        raise newException(DavXmlError, "bad nresults value")
+    parseCardLimit(root, result.hasLimit, result.limit)
     return
   # addressbook-query: optional filter + optional limit.
   let filter = root.findChild("filter")
@@ -247,16 +293,35 @@ proc parseCardReport*(body: string): CardReportRequest =
     result.testAnyOf = t == "anyof"
     for pf in filter.childrenByLocal("prop-filter"):
       result.filters.add(parseCardPropFilter(pf))
-  let limit = root.findChild("limit")
-  if limit != nil:
-    let n = limit.findChild("nresults")
-    if n == nil:
-      raise newException(DavXmlError, "limit needs nresults")
-    try:
-      result.limit = max(parseInt(nodeText(n).strip()), 0)
-      result.hasLimit = true
-    except ValueError:
-      raise newException(DavXmlError, "bad nresults value")
+  parseCardLimit(root, result.hasLimit, result.limit)
+
+proc parseSyncCollection*(body: string): SyncCollectionRequest =
+  ## Parse an RFC 6578 `sync-collection` REPORT body. The root element is
+  ## DAV-namespaced (`<D:sync-collection>`). Raises `DavXmlError` on failure.
+  if body.strip().len == 0:
+    raise newException(DavXmlError, "empty REPORT body")
+  let root = parseDavXml(body)
+  if root.localNameOf() != "sync-collection" or not root.hasDavNs():
+    raise newException(DavXmlError, "expected DAV <sync-collection> root")
+  let prop = root.findChild("prop")
+  if prop == nil:
+    raise newException(DavXmlError, "REPORT needs a prop child")
+  parseCardPropSelector(prop, result.wantEtag, result.wantAddressData,
+    result.addressDataPrefs, result.hasUnsupportedAddressData,
+    result.extraProps)
+  let st = root.findChild("sync-token")
+  if st != nil:
+    result.hasToken = true
+    result.token = nodeText(st).strip()
+  let sl = root.findChild("sync-level")
+  if sl != nil:
+    case nodeText(sl).strip().toLowerAscii()
+    of "", "1": discard
+    of "infinite": result.infinite = true
+    else:
+      raise newException(DavXmlError,
+        "sync-level must be 1 or infinite")
+  parseCardLimit(root, result.hasLimit, result.limit)
 
 # ── Matching ─────────────────────────────────────────────────────────────
 
@@ -595,7 +660,7 @@ proc resourceMatches*(content: string, filters: seq[CardPropFilter],
 
 proc isAddressContent*(content: string): bool =
   ## True when `content` parses as vCard holding at least one card with a
-  ## non-empty `FN` (the PUT gate for addressbooks).
+  ## non-empty `FN`.
   var cards: seq[VCard]
   try:
     cards = parseVCards(content)
@@ -605,6 +670,51 @@ proc isAddressContent*(content: string): bool =
     if c.fn.strip().len > 0:
       return true
   false
+
+proc requireSingleAddress*(content: string): VCard =
+  ## The single address object of a resource. Raises
+  ## `OpenParserVCardError` unless `content` holds exactly one vCard with
+  ## non-empty `FN` (RFC 6352 §6.3: one address object per resource).
+  ## This is the PUT/COPY/MOVE gate for addressbooks.
+  let cards = parseVCards(content) # raises on garbage or empty input.
+  if cards.len != 1:
+    raise newException(OpenParserVCardError,
+      "address object must contain exactly one vCard")
+  if cards[0].fn.strip().len == 0:
+    raise newException(OpenParserVCardError, "FN must not be empty")
+  cards[0]
+
+proc addressDataTarget*(prefs: seq[CardAddressDataPref]): VCardVersion =
+  ## Requested vCard version for `address-data` responses. `3.0` wins only
+  ## when every explicit `version` preference is `3.0`; otherwise 4.0
+  ## (stored bytes pass through untouched when already at target).
+  var seen = false
+  for p in prefs:
+    if p.version.len == 0:
+      continue
+    seen = true
+    if p.version != "3.0":
+      return vv40
+  if seen: vv30 else: vv40
+
+proc convertAddressData*(content: string, target: VCardVersion): string =
+  ## Serialize the cards in `content` at `target` version (openparser
+  ## downgrade to 3.0 / upgrade to 4.0). Content already at target passes
+  ## through byte-identical; unparsable content (predates the PUT gate)
+  ## is returned unchanged.
+  var cards: seq[VCard]
+  try:
+    cards = parseVCards(content)
+  except OpenParserVCardError:
+    return content
+  if cards.len == 0:
+    return content
+  for c in cards:
+    if c.version != target:
+      var opts = defaultVCardOptions()
+      opts.targetVersion = target
+      return toVCards(cards, opts)
+  content
 
 proc addressDataProp*(content: string): DavProp {.inline.} =
   DavProp(ns: CardNs, name: "address-data", value: content)

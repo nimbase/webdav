@@ -2,6 +2,7 @@
 ## loopback extended-MKCOL / PUT gate / addressbook-query / multiget.
 import std/unittest
 import std/strutils
+import std/options
 import std/httpcore except HttpMethod
 
 import webdav
@@ -25,6 +26,33 @@ N:Builder;Bob;;;
 TEL;TYPE=HOME,VOICE:+1555000222
 EMAIL;TYPE=WORK:bob@work.example
 CATEGORIES:builder,friend
+END:VCARD
+"""
+  AdaUid = """BEGIN:VCARD
+VERSION:4.0
+FN:Ada Lovelace
+N:Lovelace;Ada;;;
+UID:ada-1
+TEL;PREF=1;TYPE=cell:+1555000111
+END:VCARD
+"""
+  BobUid = """BEGIN:VCARD
+VERSION:4.0
+FN:Bob Builder
+N:Builder;Bob;;;
+UID:bob-1
+TEL;TYPE=HOME:+1555000222
+END:VCARD
+"""
+  Multi = """BEGIN:VCARD
+VERSION:4.0
+FN:One
+UID:one-1
+END:VCARD
+BEGIN:VCARD
+VERSION:4.0
+FN:Two
+UID:two-1
 END:VCARD
 """
 
@@ -338,3 +366,161 @@ suite "ctag and marker lifetime":
         buildAddressbookQuery(@["FN"], "ada"), [("Depth", "1")])
       check q.getStatusCode() == Http207
       check "ada.vcf" in q.getBodyString()
+
+suite "address-data negotiation":
+  test "version preference parsed, bad content-type flagged":
+    let r = parseCardReport(
+      """<CR:addressbook-query xmlns:D="DAV:" xmlns:CR="urn:ietf:params:xml:ns:carddav">""" &
+      """<D:prop><D:getetag/><CR:address-data version="3.0"/></D:prop>""" &
+      """</CR:addressbook-query>""")
+    check r.wantAddressData == true
+    check r.addressDataPrefs.len == 1
+    check r.addressDataPrefs[0].version == "3.0"
+    check r.hasUnsupportedAddressData == false
+    check addressDataTarget(r.addressDataPrefs) == vv30
+    let bad = parseCardReport(
+      """<CR:addressbook-query xmlns:D="DAV:" xmlns:CR="urn:ietf:params:xml:ns:carddav">""" &
+      """<D:prop><CR:address-data content-type="application/json"/></D:prop>""" &
+      """</CR:addressbook-query>""")
+    check bad.hasUnsupportedAddressData == true
+    check addressDataTarget(@[]) == vv40
+    check addressDataTarget(@[CardAddressDataPref(version: "4.0")]) == vv40
+
+  test "downgrade to 3.0 round-trips, same version passes through":
+    let down = convertAddressData(Ada, vv30)
+    check "VERSION:3.0" in down
+    check parseVCard(down).fn == "Ada Lovelace"
+    check convertAddressData(Ada, vv40) == Ada
+    check convertAddressData("junk", vv30) == "junk"
+
+  test "versioned query returns converted data, bad type is 415":
+    withAb(20978):
+      discard client.request(HttpMkcol, base & "/ab", buildMkcolAddressbook())
+      discard client.request(HttpPut, base & "/ab/ada.vcf", Ada)
+      let q = client.request(HttpReport, base & "/ab",
+        buildAddressbookQuery(@[], "", true, true, @[], false, -1, "3.0"),
+        [("Depth", "1")])
+      check q.getStatusCode() == Http207
+      check "VERSION:3.0" in q.getBodyString()
+      let bad = """<CR:addressbook-query xmlns:D="DAV:" """ &
+        """xmlns:CR="urn:ietf:params:xml:ns:carddav">""" &
+        """<D:prop><CR:address-data content-type="application/json"/></D:prop>""" &
+        """</CR:addressbook-query>"""
+      check client.request(HttpReport, base & "/ab", bad,
+        [("Depth", "1")]).getStatusCode() == Http415
+
+suite "single-card and UID gates":
+  test "requireSingleAddress accepts one, rejects multi and FN-less":
+    check requireSingleAddress(AdaUid).uid.get() == "ada-1"
+    expect OpenParserVCardError:
+      discard requireSingleAddress(Multi)
+    expect OpenParserVCardError:
+      discard requireSingleAddress("junk")
+    expect OpenParserVCardError:
+      discard requireSingleAddress(
+        "BEGIN:VCARD\r\nVERSION:4.0\r\nFN: \r\nEND:VCARD\r\n")
+
+  test "multi-card PUT is 400":
+    withAb(20979):
+      discard client.request(HttpMkcol, base & "/ab", buildMkcolAddressbook())
+      check client.request(HttpPut, base & "/ab/multi.vcf",
+        Multi).getStatusCode() == Http400
+      check client.request(HttpPut, base & "/ab/a.vcf",
+        AdaUid).getStatusCode() == Http201
+
+  test "UID reuse is 409, same-resource overwrite is fine":
+    withAb(20980):
+      discard client.request(HttpMkcol, base & "/ab", buildMkcolAddressbook())
+      check client.request(HttpPut, base & "/ab/a.vcf",
+        AdaUid).getStatusCode() == Http201
+      let dup = client.request(HttpPut, base & "/ab/b.vcf", AdaUid)
+      check dup.getStatusCode() == Http409
+      check "/ab/a.vcf" in dup.getBodyString()
+      # Same href, same UID: allowed update.
+      check client.request(HttpPut, base & "/ab/a.vcf",
+        AdaUid).getStatusCode() == Http204
+      # Same href, changed UID: conflict.
+      var changed = AdaUid.replace("ada-1", "ada-2")
+      check client.request(HttpPut, base & "/ab/a.vcf",
+        changed).getStatusCode() == Http409
+      # UID-less cards never conflict.
+      check client.request(HttpPut, base & "/ab/plain.vcf",
+        Ada).getStatusCode() == Http201
+
+  test "COPY into addressbook enforces gates":
+    withAb(20981):
+      discard client.request(HttpMkcol, base & "/ab", buildMkcolAddressbook())
+      discard client.request(HttpPut, base & "/ab/a.vcf", AdaUid)
+      discard client.request(HttpPut, base & "/outside.vcf", BobUid)
+      # Conflicting UID at destination.
+      var clash = BobUid.replace("bob-1", "ada-1")
+      discard client.request(HttpPut, base & "/clash.vcf", clash)
+      check client.request(HttpCopy, base & "/clash.vcf", "",
+        [("Destination", base & "/ab/b.vcf")]).getStatusCode() == Http409
+      # Clean copy lands.
+      check client.request(HttpCopy, base & "/outside.vcf", "",
+        [("Destination", base & "/ab/bob.vcf")]).getStatusCode() == Http201
+      let g = client.get(base & "/ab/bob.vcf")
+      check g.getStatusCode() == Http200
+      check g.getBodyString() == BobUid
+
+suite "content types and options":
+  test "vcf serves text/vcard, options advertises addressbook":
+    withAb(20982):
+      discard client.request(HttpMkcol, base & "/ab", buildMkcolAddressbook())
+      discard client.request(HttpPut, base & "/ab/ada.vcf", Ada)
+      let g = client.get(base & "/ab/ada.vcf")
+      check g.getStatusCode() == Http200
+      check ($g.getHeaders()["Content-Type"]) == "text/vcard"
+      let o = client.request(HttpOptions, base & "/")
+      check "addressbook-access" in ($o.getHeaders()["DAV"])
+      let f = client.request(HttpPropfind, base & "/ab/ada.vcf",
+        """<D:propfind xmlns:D="DAV:"><D:prop><D:getcontenttype/>""" &
+        """</D:prop></D:propfind>""", [("Depth", "0")])
+      check "text/vcard" in f.getBodyString()
+
+suite "sync-collection loopback":
+  test "initial, steady and stale tokens":
+    withAb(20983):
+      discard client.request(HttpMkcol, base & "/ab", buildMkcolAddressbook())
+      discard client.request(HttpPut, base & "/ab/ada.vcf", Ada)
+      discard client.request(HttpPut, base & "/ab/bob.vcf", Bob)
+      let s1 = client.request(HttpReport, base & "/ab", buildSyncCollection(),
+        [("Depth", "1")])
+      check s1.getStatusCode() == Http207
+      let b1 = s1.getBodyString()
+      check "ada.vcf" in b1
+      check "bob.vcf" in b1
+      check "sync-token" in b1
+      let tok = syncTokenOf(b1)
+      check tok.len > 0
+      # Steady: same token, no member responses.
+      let s2 = client.request(HttpReport, base & "/ab",
+        buildSyncCollection(tok), [("Depth", "1")])
+      check s2.getStatusCode() == Http207
+      check "<D:response>" notin s2.getBodyString()
+      check syncTokenOf(s2.getBodyString()) == tok
+      # Change moves the token; the stale token resyncs fully.
+      discard client.request(HttpPut, base & "/ab/c.vcf", AdaUid)
+      let s3 = client.request(HttpReport, base & "/ab",
+        buildSyncCollection(tok), [("Depth", "1")])
+      check s3.getStatusCode() == Http207
+      check "c.vcf" in s3.getBodyString()
+      check syncTokenOf(s3.getBodyString()) != tok
+
+  test "sync needs addressbook, depth 1, valid level":
+    withAb(20984):
+      discard client.request(HttpMkcol, base & "/plain")
+      check client.request(HttpReport, base & "/plain", buildSyncCollection(),
+        [("Depth", "1")]).getStatusCode() == Http403
+      discard client.request(HttpMkcol, base & "/ab", buildMkcolAddressbook())
+      check client.request(HttpReport, base & "/ab", buildSyncCollection(),
+        [("Depth", "infinity")]).getStatusCode() == Http400
+      let badLevel = """<D:sync-collection xmlns:D="DAV:">""" &
+        """<D:prop><D:getetag/></D:prop>""" &
+        """<D:sync-token/><D:sync-level>7</D:sync-level>""" &
+        """</D:sync-collection>"""
+      check client.request(HttpReport, base & "/ab", badLevel,
+        [("Depth", "1")]).getStatusCode() == Http422
+      expect DavClientError:
+        discard syncTokenOf("""<D:multistatus xmlns:D="DAV:"/>""")

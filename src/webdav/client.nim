@@ -162,13 +162,24 @@ proc buildCalendarQuery*(compName = "VEVENT", rangeStart = "",
     root.addChild(filter)
   davDoc(root)
 
+proc addressDataElement*(version = "", contentType = ""): XmlNode =
+  ## `<address-data>` selector element with optional `version`
+  ## (`3.0`/`4.0`) and `content-type` preferences.
+  result = newCardElement("address-data")
+  if contentType.len > 0:
+    result.addAttr("content-type", contentType)
+  if version.len > 0:
+    result.addAttr("version", version)
+
 proc buildAddressbookQuery*(filters: seq[string] = @["FN"],
     text: string = "", wantEtag = true, wantAddressData = true,
-    extra: seq[string] = @[], testAnyOf = false, limit = -1): string =
+    extra: seq[string] = @[], testAnyOf = false, limit = -1,
+    version = ""): string =
   ## `addressbook-query` REPORT body. Each entry of `filters` is a
   ## prop-filter on that vCard property; when `text` is non-empty every
   ## prop-filter carries one `contains` text-match. Empty `filters` omits
   ## `<filter>` (matches everything). `limit >= 0` adds `<limit><nresults>`.
+  ## `version` (`3.0`/`4.0`) requests that `address-data` form.
   let root = newXmlElement("CR:addressbook-query")
   root.addAttr("xmlns:D", DavNs)
   root.addAttr("xmlns:CR", CardNs)
@@ -176,7 +187,7 @@ proc buildAddressbookQuery*(filters: seq[string] = @["FN"],
   if wantEtag:
     prop.addChild(newDavElement("getetag"))
   if wantAddressData:
-    prop.addChild(newCardElement("address-data"))
+    prop.addChild(addressDataElement(version))
   for n in extra:
     prop.addChild(newDavElement(n))
   root.addChild(prop)
@@ -204,7 +215,8 @@ proc buildAddressbookQuery*(filters: seq[string] = @["FN"],
   davDoc(root)
 
 proc buildAddressbookMultiget*(hrefs: seq[string], wantEtag = true,
-    wantAddressData = true, extra: seq[string] = @[]): string =
+    wantAddressData = true, extra: seq[string] = @[],
+    version = ""): string =
   if hrefs.len == 0:
     raise newException(DavClientError, "addressbook-multiget needs hrefs")
   let root = newXmlElement("CR:addressbook-multiget")
@@ -214,7 +226,7 @@ proc buildAddressbookMultiget*(hrefs: seq[string], wantEtag = true,
   if wantEtag:
     prop.addChild(newDavElement("getetag"))
   if wantAddressData:
-    prop.addChild(newCardElement("address-data"))
+    prop.addChild(addressDataElement(version))
   for n in extra:
     prop.addChild(newDavElement(n))
   root.addChild(prop)
@@ -222,6 +234,37 @@ proc buildAddressbookMultiget*(hrefs: seq[string], wantEtag = true,
     let href = newDavElement("href")
     href.addChild(newXmlText(h))
     root.addChild(href)
+  davDoc(root)
+
+proc buildSyncCollection*(token = "", wantEtag = true,
+    wantAddressData = true, extra: seq[string] = @[],
+    version = "", limit = -1): string =
+  ## RFC 6578 `sync-collection` REPORT body. Empty `token` starts a new
+  ## sync (server answers with all members plus the current token).
+  let root = newDavElement("sync-collection")
+  root.addAttr("xmlns:D", DavNs)
+  root.addAttr("xmlns:CR", CardNs)
+  let prop = newDavElement("prop")
+  if wantEtag:
+    prop.addChild(newDavElement("getetag"))
+  if wantAddressData:
+    prop.addChild(addressDataElement(version))
+  for n in extra:
+    prop.addChild(newDavElement(n))
+  root.addChild(prop)
+  let st = newDavElement("sync-token")
+  if token.len > 0:
+    st.addChild(newXmlText(token))
+  root.addChild(st)
+  let sl = newDavElement("sync-level")
+  sl.addChild(newXmlText("1"))
+  root.addChild(sl)
+  if limit >= 0:
+    let lim = newDavElement("limit")
+    let nr = newDavElement("nresults")
+    nr.addChild(newXmlText($limit))
+    lim.addChild(nr)
+    root.addChild(lim)
   davDoc(root)
 
 proc buildMkcolAddressbook*(displayname = "", description = ""): string =
@@ -366,6 +409,24 @@ proc lockTokenOf*(res: HttpClientResponse): string =
     ($res.getHeaders()["Lock-Token"]).strip(chars = {'<', '>'})
   except KeyError:
     raise newException(DavClientError, "response lacks Lock-Token")
+
+proc syncTokenOf*(body: string): string =
+  ## The `<sync-token>` of a `sync-collection` multistatus body.
+  ## Raises `DavClientError` when absent or malformed.
+  var root: XmlNode
+  try:
+    root = parseDavXml(body)
+  except DavXmlError as e:
+    raise newException(DavClientError, "bad multistatus: " & e.msg)
+  if root.localNameOf() != "multistatus" or not root.hasDavNs():
+    raise newException(DavClientError, "bad multistatus: no multistatus root")
+  let st = root.findChild("sync-token")
+  if st == nil:
+    raise newException(DavClientError, "response lacks sync-token")
+  for c in st.children:
+    if c.kind == xnText:
+      return c.text.strip()
+  raise newException(DavClientError, "response lacks sync-token")
 
 proc findResponse*(rs: seq[DavResponse], href: string): int =
   ## Index of the response for `href`, or -1.

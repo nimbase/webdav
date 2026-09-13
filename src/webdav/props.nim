@@ -92,6 +92,16 @@ proc calendarCtag*(b: DavBackend, urlPath: string): string =
       return "\"0-0\""
   "\"" & $best & "-" & $count & "\""
 
+proc davMimeType*(b: DavBackend, urlPath: string): string =
+  ## MIME type for a resource. `.vcf` is pinned to `text/vcard` per
+  ## RFC 6352 (mimedb reports the historic `text/x-vcard` instead).
+  if urlPath.toLowerAscii().endsWith(".vcf"):
+    return "text/vcard"
+  try:
+    b.driver.mimeType(toDriverPath(urlPath))
+  except CatchableError:
+    "application/octet-stream"
+
 proc liveProps*(b: DavBackend, urlPath: string): seq[DavProp] =
   ## All live properties for a resource.
   let meta = b.driver.metadata(toDriverPath(urlPath))
@@ -145,7 +155,9 @@ proc liveProps*(b: DavBackend, urlPath: string): seq[DavProp] =
       """</D:report></D:supported-report>""" &
       """<D:supported-report xmlns:D="DAV:">""" &
       """<D:report><CR:addressbook-multiget xmlns:CR="""" & CardNs & """" />""" &
-      """</D:report></D:supported-report>"""))
+      """</D:report></D:supported-report>""" &
+      """<D:supported-report xmlns:D="DAV:">""" &
+      """<D:report><D:sync-collection /></D:report></D:supported-report>"""))
     result.add(DavProp(ns: CardNs, name: "supported-address-data",
       xml: """<CR:address-data-type content-type="text/vcard" version="3.0" """ &
       """xmlns:CR="""" & CardNs & """" />""" &
@@ -162,12 +174,8 @@ proc liveProps*(b: DavBackend, urlPath: string): seq[DavProp] =
   if not isDir:
     result.add(DavProp(ns: DavNs, name: "getcontentlength",
       value: $meta.size))
-    var ctype = "application/octet-stream"
-    try:
-      ctype = b.driver.mimeType(toDriverPath(urlPath))
-    except CatchableError:
-      discard
-    result.add(DavProp(ns: DavNs, name: "getcontenttype", value: ctype))
+    result.add(DavProp(ns: DavNs, name: "getcontenttype",
+      value: b.davMimeType(urlPath)))
 
 proc deadPropsList*(b: DavBackend, urlPath: string): seq[DavProp] =
   for k, v in b.getDead(urlPath):

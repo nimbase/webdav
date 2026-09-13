@@ -298,10 +298,12 @@ proc parseMultistatus*(body: string): seq[DavResponse] =
       r.propstats.add(stat)
     result.add(r)
 
-proc buildMultistatus*(responses: seq[DavResponse]): string =
+proc buildMultistatus*(responses: seq[DavResponse], syncToken = ""): string =
   ## Build a `<D:multistatus>` 207 body. Text content is XML-escaped by the
   ## serializer; one `<response>` per resource, one `<propstat>` per status
   ## group (multiple groups cover per-prop `403`/`404` beside `200`).
+  ## A non-empty `syncToken` appends a `<D:sync-token>` element for
+  ## RFC 6578 `sync-collection` responses.
   let ms = newDavElement("multistatus")
   ms.addAttr("xmlns:D", DavNs)
   var needCal = false
@@ -343,4 +345,8 @@ proc buildMultistatus*(responses: seq[DavResponse]): string =
       propstat.addChild(status)
       resp.addChild(propstat)
     ms.addChild(resp)
+  if syncToken.len > 0:
+    let st = newDavElement("sync-token")
+    st.addChild(newXmlText(syncToken))
+    ms.addChild(st)
   davDoc(ms)

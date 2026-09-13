@@ -7,7 +7,8 @@
 # - PROPPATCH applies best-effort in order (no atomic all-or-nothing yet).
 # - `Destination` accepts absolute URIs and absolute paths; the host part
 #   is ignored (single-origin deployment assumed).
-# - No locking yet (Class 2): `If` / `Lock-Token` are ignored.
+# - Class 2 locking is enforced (`423 Locked`); `If` evaluation is a subset
+#   (see `locks.nim`: untagged + tagged groups, `Not`, etag conditions ignored).
 # - `GET` on a collection is `403` (no listing view yet).
 #
 # CalDAV core (RFC 4791, see `caldav.nim` for the documented subset):
@@ -26,7 +27,7 @@
 import ./davmethod # stage verb extensions before powpow compiles
 export davmethod
 import std/httpcore except HttpMethod
-import std/[strutils, uri]
+import std/[strutils, uri, options]
 import powpow
 import ./backend
 import ./props
@@ -163,19 +164,44 @@ proc serveGet(srv: DavServer, req: HttpRequest, res: HttpResponse,
     res.sendError(Http500, "Read failed")
     return
   let meta = b.driver.metadata(toDriverPath(path))
-  var ctype = "application/octet-stream"
-  try:
-    ctype = b.driver.mimeType(toDriverPath(path))
-  except CatchableError:
-    discard
   res.status(Http200)
-    .header("Content-Type", ctype)
+    .header("Content-Type", b.davMimeType(path))
     .header("ETag", davEtag(meta.size, meta.lastModified))
     .header("Last-Modified", httpDate(meta.lastModified))
   if headOnly:
     res.send("")
   else:
     res.send(content)
+
+proc uidConflict(b: DavBackend, collPath, uid, excludePath: string): string =
+  ## Href of another member of addressbook `collPath` already using `uid`,
+  ## or "". UID-less cards never conflict (UID presence itself is not
+  ## enforced, only uniqueness when present).
+  if uid.len == 0:
+    return ""
+  try:
+    for m in b.driver.list(toDriverPath(collPath), recursive = false):
+      let cp = "/" & m.path
+      if cp == excludePath:
+        continue
+      var content = ""
+      try:
+        if b.isCollection(cp):
+          continue
+        content = b.driver.read(toDriverPath(cp))
+      except CatchableError:
+        continue
+      var cards: seq[VCard]
+      try:
+        cards = parseVCards(content)
+      except OpenParserVCardError:
+        continue
+      for c in cards:
+        if c.uid.isSome and c.uid.get() == uid:
+          return cp
+  except CatchableError:
+    discard
+  ""
 
 proc servePut(srv: DavServer, req: HttpRequest, res: HttpResponse) =
   let b = srv.backend
@@ -198,12 +224,33 @@ proc servePut(srv: DavServer, req: HttpRequest, res: HttpResponse) =
       not isCalendarContent(req.getBodyString()):
     res.sendError(Http400, "Calendar resources must contain iCalendar data")
     return
-  # CardDAV gate: resources inside an addressbook must hold vCard data
-  # (at least one card with non-empty FN).
-  if b.isAddressbookCollection(parentOf(path)) and
-      not isAddressContent(req.getBodyString()):
-    res.sendError(Http400, "Addressbook resources must contain vCard data")
-    return
+  # CardDAV gates (RFC 6352 §6.3): exactly one vCard with non-empty FN,
+  # plus UID uniqueness (`no-uid-conflict`: no reuse across resources,
+  # no UID change on overwrite).
+  if b.isAddressbookCollection(parentOf(path)):
+    var card: VCard
+    try:
+      card = requireSingleAddress(req.getBodyString())
+    except OpenParserVCardError as e:
+      res.sendError(Http400, e.msg)
+      return
+    if card.uid.isSome:
+      let conflict = b.uidConflict(parentOf(path), card.uid.get(), path)
+      if conflict.len > 0:
+        res.sendError(Http409, "UID already in use: " & conflict)
+        return
+      if b.exists(path) and not b.isCollection(path):
+        var oldUid = ""
+        try:
+          for oc in parseVCards(b.driver.read(toDriverPath(path))):
+            if oc.uid.isSome:
+              oldUid = oc.uid.get()
+              break
+        except CatchableError:
+          discard
+        if oldUid.len > 0 and oldUid != card.uid.get():
+          res.sendError(Http409, "Cannot change UID of an address object")
+          return
   let created = not b.exists(path)
   try:
     b.driver.write(toDriverPath(path), req.getBodyString())
@@ -399,7 +446,8 @@ proc cardPropstats(b: DavBackend, urlPath, content: string,
     except CatchableError:
       missing.add(DavProp(ns: DavNs, name: "getetag"))
   if rep.wantAddressData:
-    ok.add(addressDataProp(content))
+    ok.add(DavProp(ns: CardNs, name: "address-data",
+      value: convertAddressData(content, addressDataTarget(rep.addressDataPrefs))))
   if rep.extraProps.len > 0:
     let live = b.liveProps(urlPath)
     let dead = b.deadPropsList(urlPath)
@@ -422,10 +470,21 @@ proc cardPropstats(b: DavBackend, urlPath, content: string,
     result.add(DavPropstat(props: missing,
       status: "HTTP/1.1 404 Not Found"))
 
+proc cardPropstatsForSync(b: DavBackend, urlPath, content: string,
+    sync: SyncCollectionRequest): seq[DavPropstat] =
+  ## Same 200/404 groups as `cardPropstats` but driven by a sync request.
+  var rep = CardReportRequest(kind: rkAddressQuery,
+    wantEtag: sync.wantEtag, wantAddressData: sync.wantAddressData,
+    addressDataPrefs: sync.addressDataPrefs, extraProps: sync.extraProps)
+  b.cardPropstats(urlPath, content, rep)
+
 proc serveCardReport(srv: DavServer, req: HttpRequest, res: HttpResponse,
     path: string, rep: CardReportRequest) =
   ## CardDAV `addressbook-query` / `addressbook-multiget` (RFC 6352 §7-8).
   let b = srv.backend
+  if rep.hasUnsupportedAddressData:
+    res.sendError(Http415, "Unsupported address-data content-type")
+    return
   if rep.kind == rkAddressMultiget:
     if not b.isAddressbookCollection(path):
       res.sendError(Http403, "addressbook-multiget needs an addressbook collection")
@@ -500,9 +559,59 @@ proc serveCardReport(srv: DavServer, req: HttpRequest, res: HttpResponse,
     .header("Content-Type", "application/xml; charset=utf-8")
     .send(buildMultistatus(responses))
 
+proc serveSyncCollection(srv: DavServer, req: HttpRequest, res: HttpResponse,
+    path: string, sync: SyncCollectionRequest) =
+  ## RFC 6578 `sync-collection` over an addressbook. The sync token is the
+  ## addressbook ctag: a matching token answers with no member responses,
+  ## while a missing or stale token answers with the full member listing.
+  ## No delete tombstones are kept, so deletions surface as a full resync
+  ## (documented, not silent).
+  let b = srv.backend
+  if not b.isAddressbookCollection(path):
+    res.sendError(Http403, "sync-collection needs an addressbook collection")
+    return
+  if sync.hasUnsupportedAddressData:
+    res.sendError(Http415, "Unsupported address-data content-type")
+    return
+  let rawDepth = reqHeader(req, "Depth")
+  var depth = 1
+  if rawDepth.len > 0:
+    depth = parseDepthHeader(rawDepth)
+    if depth != 1:
+      res.sendError(Http400, "REPORT Depth must be 1")
+      return
+  let current = b.addressbookCtag(path)
+  if sync.hasToken and sync.token.len > 0 and sync.token == current:
+    res.status(Http207)
+      .header("Content-Type", "application/xml; charset=utf-8")
+      .send(buildMultistatus(@[], current))
+    return
+  var responses: seq[DavResponse]
+  try:
+    for m in b.driver.list(toDriverPath(path), recursive = false):
+      if sync.hasLimit and responses.len >= sync.limit:
+        break
+      let cp = "/" & m.path
+      if b.isCollection(cp):
+        continue
+      var content = ""
+      try:
+        content = b.driver.read(toDriverPath(cp))
+      except CatchableError:
+        continue
+      responses.add(DavResponse(href: cp,
+        propstats: b.cardPropstatsForSync(cp, content, sync)))
+  except CatchableError:
+    res.sendError(Http500, "REPORT failed")
+    return
+  res.status(Http207)
+    .header("Content-Type", "application/xml; charset=utf-8")
+    .send(buildMultistatus(responses, current))
+
 proc serveReport(srv: DavServer, req: HttpRequest, res: HttpResponse) =
   ## CalDAV `calendar-query` / `calendar-multiget` (RFC 4791 §7) plus
-  ## CardDAV `addressbook-query` / `addressbook-multiget` (RFC 6352 §7-8).
+  ## CardDAV `addressbook-query` / `addressbook-multiget` (RFC 6352 §7-8)
+  ## and `sync-collection` (RFC 6578, addressbooks only).
   ## Anything else REPORT-shaped answers `501`. Reports against a
   ## non-matching collection type answer `403`.
   let b = srv.backend
@@ -510,14 +619,31 @@ proc serveReport(srv: DavServer, req: HttpRequest, res: HttpResponse) =
   if path.len == 0 or not b.exists(path):
     res.sendError(Http404, "Not Found")
     return
-  var cardRep: CardReportRequest
-  var isCard: bool
+  # Dispatch on the root element so malformed CardDAV/`sync-collection`
+  # bodies answer `422` (their own parser errors) instead of falling
+  # through to the CalDAV branch and surfacing as `501`.
+  var peek: XmlNode
   try:
-    cardRep = parseCardReport(req.getBodyString())
-    isCard = true
-  except DavXmlError:
-    isCard = false
-  if isCard:
+    peek = parseDavXml(req.getBodyString())
+  except DavXmlError as e:
+    res.sendError(Http422, e.msg)
+    return
+  if peek.localNameOf() == "sync-collection" and peek.hasDavNs():
+    var syncRep: SyncCollectionRequest
+    try:
+      syncRep = parseSyncCollection(req.getBodyString())
+    except DavXmlError as e:
+      res.sendError(Http422, e.msg)
+      return
+    srv.serveSyncCollection(req, res, path, syncRep)
+    return
+  if peek.hasCardNs():
+    var cardRep: CardReportRequest
+    try:
+      cardRep = parseCardReport(req.getBodyString())
+    except DavXmlError as e:
+      res.sendError(Http422, e.msg)
+      return
     srv.serveCardReport(req, res, path, cardRep)
     return
   var rep: CalReportRequest
@@ -763,6 +889,33 @@ proc serveCopyMove(srv: DavServer, req: HttpRequest, res: HttpResponse,
       if depth != 0 and depth != 2:
         res.sendError(Http400, "COPY Depth must be 0 or infinity")
         return
+  # RFC 6352 preconditions for address objects landing in an addressbook:
+  # single vCard plus UID uniqueness. Collections pass through (nested
+  # collections stay lenient, as with MKCOL/MKCALENDAR nesting).
+  if b.isAddressbookCollection(parentOf(dest)) and not srcIsDir:
+    var srcCard: VCard
+    try:
+      srcCard = requireSingleAddress(b.driver.read(toDriverPath(src)))
+    except CatchableError as e:
+      res.sendError(Http400, e.msg)
+      return
+    if srcCard.uid.isSome:
+      let conflict = b.uidConflict(parentOf(dest), srcCard.uid.get(), dest)
+      if conflict.len > 0:
+        res.sendError(Http409, "UID already in use: " & conflict)
+        return
+      if destExisted and not b.isCollection(dest):
+        var oldUid = ""
+        try:
+          for oc in parseVCards(b.driver.read(toDriverPath(dest))):
+            if oc.uid.isSome:
+              oldUid = oc.uid.get()
+              break
+        except CatchableError:
+          discard
+        if oldUid.len > 0 and oldUid != srcCard.uid.get():
+          res.sendError(Http409, "Cannot change UID of an address object")
+          return
   try:
     if destExisted:
       if b.isCollection(dest):

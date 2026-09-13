@@ -18,6 +18,24 @@ SUMMARY:Client event
 END:VEVENT
 END:VCALENDAR
 """
+  AdaVcf = """BEGIN:VCARD
+VERSION:4.0
+FN:Ada Client
+N:Client;Ada;;;
+UID:ada-client-1
+END:VCARD
+"""
+  MultiVcf = """BEGIN:VCARD
+VERSION:4.0
+FN:One
+UID:one-client-1
+END:VCARD
+BEGIN:VCARD
+VERSION:4.0
+FN:Two
+UID:two-client-1
+END:VCARD
+"""
 
 template withClient(port: int, body: untyped) =
   block:
@@ -167,6 +185,27 @@ suite "client caldav loopback":
           mcodes.add(propstatCode(ps.status))
       check 200 in mcodes
       check 404 in mcodes
+
+suite "client carddav loopback":
+  test "mkcol addressbook, versioned query and sync through builders":
+    withClient(20969):
+      check dav.mkcolAddressbook("/cab", "Contacts").getStatusCode() == Http201
+      check dav.put("/cab/ada.vcf", AdaVcf).getStatusCode() == Http201
+      check dav.put("/cab/multi.vcf", MultiVcf).getStatusCode() == Http400
+      let q = dav.report("/cab", buildAddressbookQuery(@["FN"], "ada",
+        true, true, @[], false, -1, "3.0")).multistatus()
+      check q.len == 1
+      check q[0].href == "/cab/ada.vcf"
+      var gotData = ""
+      for p in q[0].okProps():
+        if p.ns == CardNs and p.name == "address-data":
+          gotData = p.value
+      check "VERSION:3.0" in gotData
+      let s = dav.report("/cab", buildSyncCollection()).ensure(Http207)
+      let tok = syncTokenOf(s.getBodyString())
+      check tok.len > 0
+      let steady = dav.report("/cab", buildSyncCollection(tok)).multistatus()
+      check steady.len == 0
 
 suite "client error helpers":
   test "multistatus and lockTokenOf reject wrong shapes":
