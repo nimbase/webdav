@@ -221,10 +221,14 @@ plus live curl runs against the disk-backed example).
 
 - [x] WebDAV client to match the server
 - [x] CardDAV (requires `openparser >= 0.3.3` for vCard support)
+- [ ] CalDAV `sync-collection` REPORT parity with CardDAV
+- [ ] Sync delete tombstones (404 entries instead of full resync)
+- [ ] Discovery + principals (`/.well-known`, `current-user-principal`, `*-home-set`, `principal-property-search`)
 - [ ] CalDAV scheduling and `free-busy-query` REPORTs
 - [ ] Auth + principal collections (`calendar-home-set`, `current-user-principal`)
 - [ ] Full `Depth: infinity` and atomic `PROPPATCH`
 - [ ] Collection listing view for `GET`
+- [ ] Interop pass against real clients (Thunderbird, DAVx⁵, macOS)
 
 ### ❤ Contributions & Support
 - 🐛 Found a bug? [Create a new Issue](https://github.com/nimbase/webdav/issues)
