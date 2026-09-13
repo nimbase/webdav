@@ -97,6 +97,22 @@ clue build examples/dav_server.nim --out:bin/dav_server
 ./bin/dav_server ./davroot 9001   # args optional, these are the defaults
 ```
 
+### Run the server binary
+
+```sh
+clue build                        # drops the server binary in bin/
+./bin/webdav --root=./davroot --port=9001 --address=127.0.0.1
+./bin/webdav --config=dav.toml    # TOML file; explicit flags override it
+./bin/webdav --help               # full option list (via cligen)
+```
+
+```toml
+# dav.toml (all keys optional, defaults as above)
+root = "./davroot"
+port = 9001
+address = "127.0.0.1"
+```
+
 ### Talk to it with curl
 
 ```sh
@@ -186,6 +202,7 @@ dav.closeClient()
 | `webdav/carddav` | REPORT parsing, prop/param-filter + text-match matching |
 | `webdav/server` | Request router (`DavServer`, `davHandler`) |
 | `webdav/client` | Sync client (`DavClient`, builders, response helpers) |
+| `webdav/config` | Server config (`DavConfig`, TOML overlay, flag precedence) |
 
 ## Tests
 
@@ -197,6 +214,7 @@ clue build tests/t_server_mem.nim --out:/tmp/t_server_mem && /tmp/t_server_mem
 clue build tests/t_caldav.nim     --out:/tmp/t_caldav     && /tmp/t_caldav
 clue build tests/t_carddav.nim    --out:/tmp/t_carddav    && /tmp/t_carddav
 clue build tests/t_client.nim     --out:/tmp/t_client     && /tmp/t_client
+clue build tests/t_cli.nim        --out:/tmp/t_cli        && /tmp/t_cli
 ```
 
 440+ checks total across unit suites and loopback servers (in-memory backend

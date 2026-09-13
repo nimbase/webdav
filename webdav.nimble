@@ -5,6 +5,10 @@ author        = "George Lemon"
 description   = "WebDAV server and client on top of powpow"
 license       = "MIT"
 srcDir        = "src"
+bin           = @["webdav"]
+binDir        = "bin"
+installExt    = @["webdav"]
+installDirs   = @["webdav"]
 
 
 # Dependencies
@@ -15,3 +19,4 @@ requires "voodoo >= 0.2.0"
 requires "openparser >= 0.3.3"
 requires "flysystem >= 0.2.0"
 requires "mimedb >= 0.1.1"
+requires "cligen >= 1.11.0"
