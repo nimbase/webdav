@@ -19,6 +19,8 @@ const
     ## The WebDAV namespace URI (RFC 4918).
   CalNs* = "urn:ietf:params:xml:ns:caldav"
     ## The CalDAV namespace URI (RFC 4791).
+  CardNs* = "urn:ietf:params:xml:ns:carddav"
+    ## The CardDAV namespace URI (RFC 6352).
   MaxDavDepth* = 8
     ## Max nested-element depth accepted in a DAV request body.
   MaxDavNodes* = 2000
@@ -231,11 +233,24 @@ proc newCalElement*(local: string): XmlNode =
   ## `<C:local>` element builder; output always uses the `C:` prefix.
   newXmlElement("C:" & local)
 
+proc newCardElement*(local: string): XmlNode =
+  ## `<CR:local>` element builder; output always uses the `CR:` prefix.
+  ## `C:` is reserved for CalDAV, so CardDAV uses `CR:` to avoid collision.
+  newXmlElement("CR:" & local)
+
 func hasCalNs*(node: XmlNode): bool =
   ## True when any `xmlns` attribute on `node` declares the CalDAV namespace.
   if node == nil or node.kind != xnElement: return false
   for k, v in node.attrs:
     if (k == "xmlns" or k.startsWith("xmlns:")) and v == CalNs:
+      return true
+  false
+
+func hasCardNs*(node: XmlNode): bool =
+  ## True when any `xmlns` attribute on `node` declares the CardDAV namespace.
+  if node == nil or node.kind != xnElement: return false
+  for k, v in node.attrs:
+    if (k == "xmlns" or k.startsWith("xmlns:")) and v == CardNs:
       return true
   false
 
@@ -258,12 +273,13 @@ proc propNs(prefix: string): string {.inline.} =
   case prefix
   of "D": DavNs
   of "C": CalNs
+  of "CR", "CARD", "Card": CardNs
   else: ""
 
 proc parseMultistatus*(body: string): seq[DavResponse] =
-  ## Parse a `207` multistatus body into responses. `D:`/`C:` prefixes map
-  ## to `DavNs`/`CalNs`; any other (or missing) prefix yields `ns == ""`,
-  ## since the server serializes foreign-namespace dead props bare.
+  ## Parse a `207` multistatus body into responses. `D:`/`C:`/`CR:` prefixes
+  ## map to `DavNs`/`CalNs`/`CardNs`; any other (or missing) prefix yields
+  ## `ns == ""`, since the server serializes foreign-namespace dead props bare.
   ## Raises `DavXmlError` on any failure.
   let root = parseDavXml(body).requireDavRoot("multistatus")
   for resp in root.childrenByLocal("response"):
@@ -289,14 +305,18 @@ proc buildMultistatus*(responses: seq[DavResponse]): string =
   let ms = newDavElement("multistatus")
   ms.addAttr("xmlns:D", DavNs)
   var needCal = false
+  var needCard = false
   for r in responses:
     for ps in r.propstats:
       for p in ps.props:
         if p.ns == CalNs:
           needCal = true
-          break
+        elif p.ns == CardNs:
+          needCard = true
   if needCal:
     ms.addAttr("xmlns:C", CalNs)
+  if needCard:
+    ms.addAttr("xmlns:CR", CardNs)
   for r in responses:
     let resp = newDavElement("response")
     let href = newDavElement("href")
@@ -309,6 +329,7 @@ proc buildMultistatus*(responses: seq[DavResponse]): string =
         let elem =
           if p.ns == DavNs: newDavElement(p.name)
           elif p.ns == CalNs: newCalElement(p.name)
+          elif p.ns == CardNs: newCardElement(p.name)
           else: newXmlElement(p.name)
         if p.xml.len > 0:
           for n in parseFragment(p.xml):

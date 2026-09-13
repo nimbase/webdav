@@ -27,6 +27,7 @@ type
     locks*: LockManager
     deadProps*: Table[string, Table[string, DeadProp]] ## urlPath -> key -> prop
     calendars*: Table[string, bool] ## urlPath of a collection -> is calendar
+    addressbooks*: Table[string, bool] ## urlPath of a collection -> is addressbook
 
   MemNode = ref object
     isDir: bool
@@ -226,7 +227,8 @@ method append*(d: MemoryDriver, path, content: string) =
 proc newDavBackend*(driver: StorageDriver): DavBackend =
   DavBackend(driver: driver, locks: newLockManager(),
     deadProps: initTable[string, Table[string, DeadProp]](),
-    calendars: initTable[string, bool]())
+    calendars: initTable[string, bool](),
+    addressbooks: initTable[string, bool]())
 
 proc isCalendarCollection*(b: DavBackend, urlPath: string): bool {.inline.} =
   ## True when `urlPath` was created via MKCALENDAR (CalDAV calendar).
@@ -234,6 +236,13 @@ proc isCalendarCollection*(b: DavBackend, urlPath: string): bool {.inline.} =
 
 proc markCalendar*(b: DavBackend, urlPath: string) {.inline.} =
   b.calendars[urlPath] = true
+
+proc isAddressbookCollection*(b: DavBackend, urlPath: string): bool {.inline.} =
+  ## True when `urlPath` was created via extended MKCOL (CardDAV addressbook).
+  b.addressbooks.getOrDefault(urlPath, false)
+
+proc markAddressbook*(b: DavBackend, urlPath: string) {.inline.} =
+  b.addressbooks[urlPath] = true
 
 func toDriverPath*(urlPath: string): string {.inline.} =
   ## `/a/b` -> `a/b`; `/` -> `""`.
@@ -261,7 +270,7 @@ proc delDead*(b: DavBackend, urlPath, ns, name: string): bool =
 
 proc forgetDead*(b: DavBackend, urlPath: string) =
   ## Drop dead props for a resource and, for collections, its members.
-  ## Calendar markers travel with the same lifetime.
+  ## Calendar / addressbook markers travel with the same lifetime.
   var doomed: seq[string]
   for k in b.deadProps.keys:
     if k == urlPath or k.startsWith(urlPath & "/"):
@@ -274,10 +283,17 @@ proc forgetDead*(b: DavBackend, urlPath: string) =
       doomedCal.add(k)
   for k in doomedCal:
     b.calendars.del(k)
+  var doomedAb: seq[string]
+  for k in b.addressbooks.keys:
+    if k == urlPath or k.startsWith(urlPath & "/"):
+      doomedAb.add(k)
+  for k in doomedAb:
+    b.addressbooks.del(k)
 
 proc copyDead*(b: DavBackend, src, dest: string, overwrite: bool) =
   ## Duplicate dead props across COPY. For collections, remap members.
-  ## The source entries stay in place. Calendar markers are carried too.
+  ## The source entries stay in place. Calendar / addressbook markers
+  ## are carried too.
   if overwrite:
     b.forgetDead(dest)
   var carried: seq[(string, Table[string, DeadProp])]
@@ -298,6 +314,15 @@ proc copyDead*(b: DavBackend, src, dest: string, overwrite: bool) =
       if k == src: dest
       else: dest & k[src.len .. ^1]
     b.calendars[nk] = true
+  var carriedAb: seq[string]
+  for k in b.addressbooks.keys:
+    if k == src or k.startsWith(src & "/"):
+      carriedAb.add(k)
+  for k in carriedAb:
+    let nk =
+      if k == src: dest
+      else: dest & k[src.len .. ^1]
+    b.addressbooks[nk] = true
 
 proc moveDead*(b: DavBackend, src, dest: string, overwrite: bool) =
   ## Carry dead props across MOVE. For collections, remap members.

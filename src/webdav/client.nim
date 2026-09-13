@@ -62,6 +62,7 @@ proc serializeProp(p: DavProp): XmlNode =
   let elem =
     if p.ns == DavNs: newDavElement(p.name)
     elif p.ns == CalNs: newCalElement(p.name)
+    elif p.ns == CardNs: newCardElement(p.name)
     else: newXmlElement(p.name)
   if p.xml.len > 0:
     for n in parseFragment(p.xml):
@@ -161,6 +162,92 @@ proc buildCalendarQuery*(compName = "VEVENT", rangeStart = "",
     root.addChild(filter)
   davDoc(root)
 
+proc buildAddressbookQuery*(filters: seq[string] = @["FN"],
+    text: string = "", wantEtag = true, wantAddressData = true,
+    extra: seq[string] = @[], testAnyOf = false, limit = -1): string =
+  ## `addressbook-query` REPORT body. Each entry of `filters` is a
+  ## prop-filter on that vCard property; when `text` is non-empty every
+  ## prop-filter carries one `contains` text-match. Empty `filters` omits
+  ## `<filter>` (matches everything). `limit >= 0` adds `<limit><nresults>`.
+  let root = newXmlElement("CR:addressbook-query")
+  root.addAttr("xmlns:D", DavNs)
+  root.addAttr("xmlns:CR", CardNs)
+  let prop = newDavElement("prop")
+  if wantEtag:
+    prop.addChild(newDavElement("getetag"))
+  if wantAddressData:
+    prop.addChild(newCardElement("address-data"))
+  for n in extra:
+    prop.addChild(newDavElement(n))
+  root.addChild(prop)
+  if filters.len > 0 or limit >= 0:
+    if filters.len > 0:
+      let filter = newCardElement("filter")
+      filter.addAttr("test", if testAnyOf: "anyof" else: "allof")
+      for f in filters:
+        let pf = newCardElement("prop-filter")
+        pf.addAttr("name", f)
+        if text.len > 0:
+          let tm = newCardElement("text-match")
+          tm.addAttr("collation", "i;unicode-casemap")
+          tm.addAttr("match-type", "contains")
+          tm.addChild(newXmlText(text))
+          pf.addChild(tm)
+        filter.addChild(pf)
+      root.addChild(filter)
+    if limit >= 0:
+      let lim = newCardElement("limit")
+      let nr = newCardElement("nresults")
+      nr.addChild(newXmlText($limit))
+      lim.addChild(nr)
+      root.addChild(lim)
+  davDoc(root)
+
+proc buildAddressbookMultiget*(hrefs: seq[string], wantEtag = true,
+    wantAddressData = true, extra: seq[string] = @[]): string =
+  if hrefs.len == 0:
+    raise newException(DavClientError, "addressbook-multiget needs hrefs")
+  let root = newXmlElement("CR:addressbook-multiget")
+  root.addAttr("xmlns:D", DavNs)
+  root.addAttr("xmlns:CR", CardNs)
+  let prop = newDavElement("prop")
+  if wantEtag:
+    prop.addChild(newDavElement("getetag"))
+  if wantAddressData:
+    prop.addChild(newCardElement("address-data"))
+  for n in extra:
+    prop.addChild(newDavElement(n))
+  root.addChild(prop)
+  for h in hrefs:
+    let href = newDavElement("href")
+    href.addChild(newXmlText(h))
+    root.addChild(href)
+  davDoc(root)
+
+proc buildMkcolAddressbook*(displayname = "", description = ""): string =
+  ## Extended MKCOL body creating an addressbook collection, with optional
+  ## dead-prop defaults stored by the server.
+  let root = newDavElement("mkcol")
+  root.addAttr("xmlns:D", DavNs)
+  root.addAttr("xmlns:CR", CardNs)
+  let setNode = newDavElement("set")
+  let prop = newDavElement("prop")
+  let rt = newDavElement("resourcetype")
+  rt.addChild(newDavElement("collection"))
+  rt.addChild(newCardElement("addressbook"))
+  prop.addChild(rt)
+  if displayname.len > 0:
+    let dn = newDavElement("displayname")
+    dn.addChild(newXmlText(displayname))
+    prop.addChild(dn)
+  if description.len > 0:
+    let desc = newCardElement("addressbook-description")
+    desc.addChild(newXmlText(description))
+    prop.addChild(desc)
+  setNode.addChild(prop)
+  root.addChild(setNode)
+  davDoc(root)
+
 proc buildCalendarMultiget*(hrefs: seq[string], wantEtag = true,
     wantCalData = true, extra: seq[string] = @[]): string =
   if hrefs.len == 0:
@@ -203,8 +290,14 @@ proc delete*(c: DavClient, path: string,
     headers: openArray[(string, string)] = []): HttpClientResponse {.inline, discardable.} =
   c.raw(HttpDelete, path, "", headers)
 
-proc mkcol*(c: DavClient, path: string): HttpClientResponse {.inline, discardable.} =
-  c.raw(HttpMkcol, path)
+proc mkcol*(c: DavClient, path: string,
+    body = ""): HttpClientResponse {.inline, discardable.} =
+  c.raw(HttpMkcol, path, body)
+
+proc mkcolAddressbook*(c: DavClient, path: string, displayname = "",
+    description = ""): HttpClientResponse {.inline, discardable.} =
+  ## Extended MKCOL creating an addressbook collection.
+  c.raw(HttpMkcol, path, buildMkcolAddressbook(displayname, description))
 
 proc mkcalendar*(c: DavClient, path: string; body = ""): HttpClientResponse {.inline, discardable.} =
   c.raw(HttpMkcalendar, path, body)

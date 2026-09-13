@@ -15,6 +15,13 @@
 # `calendar-query` (comp-filter + time-range with recurrence expansion)
 # and `calendar-multiget`. PUT into a calendar requires iCalendar object
 # data. `OPTIONS` advertises `calendar-access`.
+#
+# CardDAV core (RFC 6352, see `carddav.nim` for the documented subset):
+# extended `MKCOL` with `<resourcetype><addressbook/></resourcetype>`
+# creates addressbook collections; REPORT serves `addressbook-query`
+# (prop-filter + param-filter + text-match) and `addressbook-multiget`.
+# PUT into an addressbook requires vCard object data. `OPTIONS` advertises
+# `addressbook-access`.
 
 import ./davmethod # stage verb extensions before powpow compiles
 export davmethod
@@ -24,10 +31,12 @@ import powpow
 import ./backend
 import ./props
 import ./caldav
+import ./carddav
 
 export backend
 export props
 export caldav
+export carddav
 
 const
   DavAllow* = "OPTIONS, GET, HEAD, POST, PUT, DELETE, MKCOL, MKCALENDAR, " &
@@ -133,7 +142,7 @@ proc parentIsCollection(b: DavBackend, urlPath: string): bool =
 proc serveOptions(srv: DavServer, req: HttpRequest, res: HttpResponse) =
   res.status(Http200)
     .header("Allow", DavAllow)
-    .header("DAV", "1, 2, calendar-access")
+    .header("DAV", "1, 2, calendar-access, addressbook-access")
     .header("Content-Length", "0")
     .send("")
 
@@ -189,6 +198,12 @@ proc servePut(srv: DavServer, req: HttpRequest, res: HttpResponse) =
       not isCalendarContent(req.getBodyString()):
     res.sendError(Http400, "Calendar resources must contain iCalendar data")
     return
+  # CardDAV gate: resources inside an addressbook must hold vCard data
+  # (at least one card with non-empty FN).
+  if b.isAddressbookCollection(parentOf(path)) and
+      not isAddressContent(req.getBodyString()):
+    res.sendError(Http400, "Addressbook resources must contain vCard data")
+    return
   let created = not b.exists(path)
   try:
     b.driver.write(toDriverPath(path), req.getBodyString())
@@ -221,13 +236,14 @@ proc serveDelete(srv: DavServer, req: HttpRequest, res: HttpResponse) =
   res.status(Http204).send("")
 
 proc serveMkcol(srv: DavServer, req: HttpRequest, res: HttpResponse) =
+  ## Plain MKCOL plus RFC 6352 extended MKCOL: a body carrying
+  ## `<resourcetype><collection/><addressbook/></resourcetype>` creates an
+  ## addressbook collection. Any other non-empty body is `415`, matching the
+  ## previous Class 1 behavior. Addressbooks may nest (lenient, documented).
   let b = srv.backend
   let path = normPath(req.getPath())
   if path.len == 0 or path == "/":
     res.sendError(Http405, "Collection already exists")
-    return
-  if req.getBodyString().len > 0:
-    res.sendError(Http415, "MKCOL with a body is not supported")
     return
   if b.exists(path):
     res.sendError(Http405, "Resource already exists")
@@ -238,11 +254,48 @@ proc serveMkcol(srv: DavServer, req: HttpRequest, res: HttpResponse) =
   if b.lockedOut(path, req):
     res.sendError(Http423, "Locked")
     return
+  if req.getBodyString().strip().len == 0:
+    try:
+      b.driver.makeDir(toDriverPath(path))
+    except CatchableError:
+      res.sendError(Http500, "MKCOL failed")
+      return
+    res.status(Http201).send("")
+    return
+  var isAb = false
+  var bodyProps: seq[DavProp]
+  try:
+    (isAb, bodyProps) = parseMkcolAddressbook(req.getBodyString())
+  except DavXmlError as e:
+    # Non-XML bodies keep the historic Class 1 `415`; XML that fails
+    # to parse as extended MKCOL is `422`.
+    if req.getBodyString().strip().startsWith("<"):
+      res.sendError(Http422, e.msg)
+    else:
+      res.sendError(Http415, "MKCOL with a body is not supported")
+    return
+  if not isAb:
+    # A calendar resourcetype via MKCOL hints at the wrong verb.
+    if "calendar" in req.getBodyString().toLowerAscii():
+      res.sendError(Http403, "Use MKCALENDAR for calendars")
+    else:
+      res.sendError(Http415, "MKCOL with a body is not supported")
+    return
+  for p in bodyProps:
+    if p.ns == DavNs and isProtectedLive(p.name):
+      res.sendError(Http403, "Protected live property: " & p.name)
+      return
   try:
     b.driver.makeDir(toDriverPath(path))
   except CatchableError:
     res.sendError(Http500, "MKCOL failed")
     return
+  b.markAddressbook(path)
+  for p in bodyProps:
+    if p.xml.len > 0:
+      b.setDead(path, p.ns, p.name, "", p.xml)
+    else:
+      b.setDead(path, p.ns, p.name, p.value, "")
   res.status(Http201).send("")
 
 proc serveMkcalendar(srv: DavServer, req: HttpRequest, res: HttpResponse) =
@@ -334,20 +387,144 @@ proc calPropstats(b: DavBackend, urlPath, content: string,
     result.add(DavPropstat(props: missing,
       status: "HTTP/1.1 404 Not Found"))
 
+proc cardPropstats(b: DavBackend, urlPath, content: string,
+    rep: CardReportRequest): seq[DavPropstat] =
+  ## 200/404 propstat groups for one matched address object resource.
+  var ok, missing: seq[DavProp]
+  if rep.wantEtag:
+    try:
+      let meta = b.driver.metadata(toDriverPath(urlPath))
+      ok.add(DavProp(ns: DavNs, name: "getetag",
+        value: davEtag(meta.size, meta.lastModified)))
+    except CatchableError:
+      missing.add(DavProp(ns: DavNs, name: "getetag"))
+  if rep.wantAddressData:
+    ok.add(addressDataProp(content))
+  if rep.extraProps.len > 0:
+    let live = b.liveProps(urlPath)
+    let dead = b.deadPropsList(urlPath)
+    for name in rep.extraProps:
+      let li = live.findLive(name)
+      if li >= 0:
+        ok.add(live[li])
+        continue
+      var found = false
+      for pr in dead:
+        if pr.name == name:
+          ok.add(pr)
+          found = true
+          break
+      if not found:
+        missing.add(DavProp(ns: DavNs, name: name))
+  if ok.len > 0:
+    result.add(DavPropstat(props: ok, status: "HTTP/1.1 200 OK"))
+  if missing.len > 0:
+    result.add(DavPropstat(props: missing,
+      status: "HTTP/1.1 404 Not Found"))
+
+proc serveCardReport(srv: DavServer, req: HttpRequest, res: HttpResponse,
+    path: string, rep: CardReportRequest) =
+  ## CardDAV `addressbook-query` / `addressbook-multiget` (RFC 6352 §7-8).
+  let b = srv.backend
+  if rep.kind == rkAddressMultiget:
+    if not b.isAddressbookCollection(path):
+      res.sendError(Http403, "addressbook-multiget needs an addressbook collection")
+      return
+    var responses: seq[DavResponse]
+    var n = 0
+    for href in rep.hrefs:
+      if rep.hasLimit and n >= rep.limit:
+        break
+      let rp = hrefToPath(href)
+      if rp.len == 0 or not b.exists(rp) or b.isCollection(rp) or
+          (rp != path and not rp.startsWith(collHref(path))):
+        responses.add(DavResponse(href: href,
+          propstats: @[DavPropstat(props: @[],
+            status: "HTTP/1.1 404 Not Found")]))
+        continue
+      var content = ""
+      try:
+        content = b.driver.read(toDriverPath(rp))
+      except CatchableError:
+        responses.add(DavResponse(href: href,
+          propstats: @[DavPropstat(props: @[],
+            status: "HTTP/1.1 404 Not Found")]))
+        continue
+      responses.add(DavResponse(href: rp,
+        propstats: b.cardPropstats(rp, content, rep)))
+      inc n
+    res.status(Http207)
+      .header("Content-Type", "application/xml; charset=utf-8")
+      .send(buildMultistatus(responses))
+    return
+  # addressbook-query: Depth 0 or 1 (default 1); infinity is rejected.
+  let rawDepth = reqHeader(req, "Depth")
+  var depth = 1
+  if rawDepth.len > 0:
+    depth = parseDepthHeader(rawDepth)
+    if depth != 0 and depth != 1:
+      res.sendError(Http400, "REPORT Depth must be 0 or 1")
+      return
+  var candidates: seq[string]
+  if b.isCollection(path):
+    if not b.isAddressbookCollection(path):
+      res.sendError(Http403, "addressbook-query needs an addressbook collection")
+      return
+    if depth == 1:
+      try:
+        for m in b.driver.list(toDriverPath(path), recursive = false):
+          let cp = "/" & m.path
+          if not b.isCollection(cp):
+            candidates.add(cp)
+      except CatchableError:
+        res.sendError(Http500, "REPORT failed")
+        return
+  else:
+    if not b.isAddressbookCollection(parentOf(path)):
+      res.sendError(Http403, "addressbook-query needs an addressbook resource")
+      return
+    candidates.add(path)
+  var responses: seq[DavResponse]
+  for cp in candidates:
+    if rep.hasLimit and responses.len >= rep.limit:
+      break
+    var content = ""
+    try:
+      content = b.driver.read(toDriverPath(cp))
+    except CatchableError:
+      continue
+    if carddav.resourceMatches(content, rep.filters, rep.testAnyOf):
+      responses.add(DavResponse(href: cp,
+        propstats: b.cardPropstats(cp, content, rep)))
+  res.status(Http207)
+    .header("Content-Type", "application/xml; charset=utf-8")
+    .send(buildMultistatus(responses))
+
 proc serveReport(srv: DavServer, req: HttpRequest, res: HttpResponse) =
-  ## CalDAV `calendar-query` / `calendar-multiget` (RFC 4791 §7).
-  ## Anything else REPORT-shaped answers `501`. Calendar reports against
-  ## a non-calendar target answer `403`.
+  ## CalDAV `calendar-query` / `calendar-multiget` (RFC 4791 §7) plus
+  ## CardDAV `addressbook-query` / `addressbook-multiget` (RFC 6352 §7-8).
+  ## Anything else REPORT-shaped answers `501`. Reports against a
+  ## non-matching collection type answer `403`.
   let b = srv.backend
   let path = normPath(req.getPath())
   if path.len == 0 or not b.exists(path):
     res.sendError(Http404, "Not Found")
     return
+  var cardRep: CardReportRequest
+  var isCard: bool
+  try:
+    cardRep = parseCardReport(req.getBodyString())
+    isCard = true
+  except DavXmlError:
+    isCard = false
+  if isCard:
+    srv.serveCardReport(req, res, path, cardRep)
+    return
   var rep: CalReportRequest
   try:
     rep = parseCalReport(req.getBodyString())
   except DavXmlError as e:
-    # Non-CalDAV REPORT roots (e.g. DAV-only bodies) are unimplemented.
+    # Non-CalDAV/CardDAV REPORT roots (e.g. DAV-only bodies) are unimplemented.
     if "unsupported REPORT" in e.msg or "not a CalDAV element" in e.msg:
       res.sendError(Http501, "Not Implemented: " & e.msg)
     else:
@@ -414,7 +591,7 @@ proc serveReport(srv: DavServer, req: HttpRequest, res: HttpResponse) =
       content = b.driver.read(toDriverPath(cp))
     except CatchableError:
       continue
-    if resourceMatches(content, rep.compName, rep.timeRange,
+    if caldav.resourceMatches(content, rep.compName, rep.timeRange,
         rep.hasTimeRange):
       responses.add(DavResponse(href: cp,
         propstats: b.calPropstats(cp, content, rep)))

@@ -44,6 +44,29 @@ proc displayName*(urlPath: string): string =
       return parts[i]
   "/"
 
+proc addressbookCtag*(b: DavBackend, urlPath: string): string =
+  ## Opaque change tag for an addressbook collection. Same construction as
+  ## the calendar ctag: max member mtime plus member count.
+  var best: int64 = 0
+  var count = 0
+  try:
+    for m in b.driver.list(toDriverPath(urlPath), recursive = false):
+      inc count
+      let v = m.lastModified.toUnix * 1_000_000_000 + m.lastModified.nanosecond
+      if v > best:
+        best = v
+  except CatchableError:
+    best = 0
+    count = 0
+  if best == 0 and count == 0:
+    try:
+      let meta = b.driver.metadata(toDriverPath(urlPath))
+      return "\"" & $meta.lastModified.toUnix & "-" &
+        $meta.lastModified.nanosecond & "\""
+    except CatchableError:
+      return "\"0-0\""
+  "\"" & $best & "-" & $count & "\""
+
 proc calendarCtag*(b: DavBackend, urlPath: string): string =
   ## Opaque change tag for a calendar collection: max member mtime
   ## (nanosecond precision) plus member count, so PUT/DELETE of an event
@@ -74,11 +97,15 @@ proc liveProps*(b: DavBackend, urlPath: string): seq[DavProp] =
   let meta = b.driver.metadata(toDriverPath(urlPath))
   let isDir = meta.isDir
   let isCal = isDir and b.isCalendarCollection(urlPath)
+  let isAb = isDir and b.isAddressbookCollection(urlPath)
   let restypeXml =
     if not isDir: ""
     elif isCal:
       """<D:collection xmlns:D="DAV:"/>""" &
       """<C:calendar xmlns:C="""" & CalNs & """" />"""
+    elif isAb:
+      """<D:collection xmlns:D="DAV:"/>""" &
+      """<CR:addressbook xmlns:CR="""" & CardNs & """" />"""
     else: """<D:collection xmlns:D="DAV:"/>"""
   result.add(DavProp(ns: DavNs, name: "resourcetype", xml: restypeXml))
   # `displayname` is live but client-writable (RFC 4918 §15.2.2): a stored
@@ -109,6 +136,29 @@ proc liveProps*(b: DavBackend, urlPath: string): seq[DavProp] =
       """<D:supported-report xmlns:D="DAV:">""" &
       """<D:report><C:calendar-multiget xmlns:C="""" & CalNs & """" />""" &
       """</D:report></D:supported-report>"""))
+  if isAb:
+    result.add(DavProp(ns: DavNs, name: "getctag",
+      value: b.addressbookCtag(urlPath)))
+    result.add(DavProp(ns: DavNs, name: "supported-report-set",
+      xml: """<D:supported-report xmlns:D="DAV:">""" &
+      """<D:report><CR:addressbook-query xmlns:CR="""" & CardNs & """" />""" &
+      """</D:report></D:supported-report>""" &
+      """<D:supported-report xmlns:D="DAV:">""" &
+      """<D:report><CR:addressbook-multiget xmlns:CR="""" & CardNs & """" />""" &
+      """</D:report></D:supported-report>"""))
+    result.add(DavProp(ns: CardNs, name: "supported-address-data",
+      xml: """<CR:address-data-type content-type="text/vcard" version="3.0" """ &
+      """xmlns:CR="""" & CardNs & """" />""" &
+      """<CR:address-data-type content-type="text/vcard" version="4.0" """ &
+      """xmlns:CR="""" & CardNs & """" />"""))
+    var abDesc = ""
+    for k, v in b.getDead(urlPath):
+      if v.ns == CardNs and k.split('\x00')[^1] == "addressbook-description":
+        abDesc = v.value
+        break
+    if abDesc.len > 0:
+      result.add(DavProp(ns: CardNs, name: "addressbook-description",
+        value: abDesc))
   if not isDir:
     result.add(DavProp(ns: DavNs, name: "getcontentlength",
       value: $meta.size))

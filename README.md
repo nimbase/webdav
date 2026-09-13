@@ -13,11 +13,11 @@
   <img src="https://github.com/nimbase/webdav/workflows/test/badge.svg" alt="Github Actions">  <img src="https://github.com/nimbase/webdav/workflows/docs/badge.svg" alt="Github Actions">
 </p>
 
-WebDAV file sharing plus calendar hosting in one embeddable server.
-It runs on [PowPow](https://github.com/nimbase/powpow) (async event loop,
+WebDAV file sharing plus calendar and contact hosting in one embeddable server.
+It runs on [PowPow](https://github.com/openpeeps/powpow) (async event loop,
 HTTP/1 + HTTP/2), stores data through any
-[flysystem](https://github.com/nimbase/supranim-packages) driver, and parses
-iCalendar via [openparser](https://github.com/openpeeps/openparser).
+[flysystem](https://github.com/openpeeps/flysystem) driver, and parses
+iCalendar and vCard via [openparser](https://github.com/openpeeps/openparser).
 The extra HTTP verbs (`PROPFIND`, `LOCK`, `REPORT`, ...) are registered at
 compile time through [voodoo](https://github.com/nimbase/voodoo) extensible
 enums, so `powpow` itself stays generic.
@@ -54,6 +54,17 @@ enums, so `powpow` itself stays generic.
 - `PUT` gate: resources inside a calendar must hold iCalendar object data
 - `getctag` change tags and `supported-report-set` on calendars
 
+**CardDAV core (RFC 6352)**
+
+- Extended `MKCOL` with `<resourcetype><collection/><addressbook/></resourcetype>`
+  creates addressbook collections (plain `MKCOL` unchanged, `415` for other bodies)
+- `REPORT` `addressbook-query` (`prop-filter` + `param-filter` + `text-match` +
+  `is-not-defined`, `test="anyof|allof"`, `negate-condition`, `limit/nresults`)
+  and `addressbook-multiget`, returning `getetag` + `address-data`
+- `PUT` gate: resources inside an addressbook must hold vCard object data
+- `getctag` change tags, `supported-report-set` and `supported-address-data`
+  on addressbooks, `addressbook-description` dead-prop default via extended `MKCOL`
+
 **Plumbing**
 
 - Any flysystem `StorageDriver` backend (`LocalDriver` on disk,
@@ -63,10 +74,11 @@ enums, so `powpow` itself stays generic.
 **Client (RFC 4918 + CalDAV reports)**
 
 - `DavClient` over powpow's sync `HttpClient`: one helper per verb
-  (`propfind`, `proppatch`, `mkcol`, `mkcalendar`, `copy`, `move`,
-  `lock`, `unlock`, `report`, plus plain `get`/`put`/`delete`)
+  (`propfind`, `proppatch`, `mkcol`, `mkcolAddressbook`, `mkcalendar`, `copy`,
+  `move`, `lock`, `unlock`, `report`, plus plain `get`/`put`/`delete`)
 - Request builders (`buildPropertyupdate`, `buildLockinfo`,
-  `buildCalendarQuery`, `buildCalendarMultiget`) that round-trip through
+  `buildCalendarQuery`, `buildCalendarMultiget`, `buildAddressbookQuery`,
+  `buildAddressbookMultiget`, `buildMkcolAddressbook`) that round-trip through
   the server parsers
 - Response helpers: `multistatus` parsing into `DavResponse`s,
   `propstatCode`, `lockTokenOf`, `ensure` for status assertions
@@ -112,6 +124,19 @@ END:VCALENDAR' -i
 curl -X REPORT http://localhost:9001/cal -H 'Depth: 1' \
   -H 'Content-Type: application/xml' \
   -d '<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:prop><D:getetag/><C:calendar-data/></D:prop><C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT"><C:time-range start="20260105T000000Z" end="20260106T000000Z"/></C:comp-filter></C:comp-filter></C:filter></C:calendar-query>' -i
+
+# CardDAV: addressbook, contact, FN query
+curl -X MKCOL http://localhost:9001/ab -H 'Content-Type: application/xml' \
+  -d '<D:mkcol xmlns:D="DAV:" xmlns:CR="urn:ietf:params:xml:ns:carddav"><D:set><D:prop><D:resourcetype><D:collection/><CR:addressbook/></D:resourcetype><D:displayname>Contacts</D:displayname></D:prop></D:set></D:mkcol>' -i
+curl -X PUT http://localhost:9001/ab/ada.vcf -H 'Content-Type: text/vcard' \
+  -d 'BEGIN:VCARD
+VERSION:4.0
+FN:Ada Lovelace
+N:Lovelace;Ada;;;
+END:VCARD' -i
+curl -X REPORT http://localhost:9001/ab -H 'Depth: 1' \
+  -H 'Content-Type: application/xml' \
+  -d '<CR:addressbook-query xmlns:D="DAV:" xmlns:CR="urn:ietf:params:xml:ns:carddav"><D:prop><D:getetag/><CR:address-data/></D:prop><CR:filter><CR:prop-filter name="FN"><CR:text-match collation="i;unicode-casemap" match-type="contains">ada</CR:text-match></CR:prop-filter></CR:filter></CR:addressbook-query>' -i
 ```
 
 ### Embed it in your app
@@ -153,6 +178,7 @@ dav.closeClient()
 | `webdav/props` | Live property computation |
 | `webdav/locks` | Lock manager, `Timeout`/`If` parsing |
 | `webdav/caldav` | REPORT parsing, time-range + recurrence matching |
+| `webdav/carddav` | REPORT parsing, prop/param-filter + text-match matching |
 | `webdav/server` | Request router (`DavServer`, `davHandler`) |
 | `webdav/client` | Sync client (`DavClient`, builders, response helpers) |
 
@@ -164,10 +190,11 @@ clue build tests/t_davxml.nim     --out:/tmp/t_davxml     && /tmp/t_davxml
 clue build tests/t_locks.nim      --out:/tmp/t_locks      && /tmp/t_locks
 clue build tests/t_server_mem.nim --out:/tmp/t_server_mem && /tmp/t_server_mem
 clue build tests/t_caldav.nim     --out:/tmp/t_caldav     && /tmp/t_caldav
+clue build tests/t_carddav.nim    --out:/tmp/t_carddav    && /tmp/t_carddav
 clue build tests/t_client.nim     --out:/tmp/t_client     && /tmp/t_client
 ```
 
-70 checks total across unit suites and loopback servers (in-memory backend
+360+ checks total across unit suites and loopback servers (in-memory backend
 plus live curl runs against the disk-backed example).
 
 ## Known limits
@@ -179,11 +206,14 @@ plus live curl runs against the disk-backed example).
 - `GET` on a collection answers `403` (no HTML listing view)
 - Recurrence and timezone handling follow the documented subset in
   `src/webdav/caldav.nim` (clamped month overflow, UTC-normalized times)
+- CardDAV filter handling follows the documented subset in
+  `src/webdav/carddav.nim` (`address-data` preferences ignored, multi-card
+  resources accepted leniently, no `principal-property-search`/`sync-collection`/ACLs yet)
 
 ## Roadmap
 
 - [x] WebDAV client to match the server
-- [ ] CardDAV (blocked upstream: `openparser` has no vCard parser yet)
+- [x] CardDAV (requires `openparser >= 0.3.3` for vCard support)
 - [ ] CalDAV scheduling and `free-busy-query` REPORTs
 - [ ] Auth + principal collections (`calendar-home-set`, `current-user-principal`)
 - [ ] Full `Depth: infinity` and atomic `PROPPATCH`
