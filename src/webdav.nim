@@ -6,7 +6,7 @@
 
 import webdav/davmethod
 import powpow
-import webdav/[types, davxml, backend, props, caldav, server]
+import webdav/[types, davxml, backend, props, caldav, server, client]
 
 export davmethod
 export powpow
@@ -16,3 +16,4 @@ export backend
 export props
 export caldav
 export server
+export client

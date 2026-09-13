@@ -156,7 +156,7 @@ proc parsePropfind*(body: string): PropfindRequest =
   for c in prop.elementChildren():
     result.props.add(localName(c.tag))
 
-proc parsePropValue*(node: XmlNode): DavProp =
+proc parsePropValue*(node: XmlNode, ns = DavNs): DavProp =
   ## Pure-text values stay in `value`; anything structural is preserved
   ## verbatim in `xml` so dead properties round-trip exactly as sent.
   var hasElements = false
@@ -169,11 +169,11 @@ proc parsePropValue*(node: XmlNode): DavProp =
     for c in node.children:
       if c.kind == xnText:
         value.add(c.text)
-    return DavProp(ns: DavNs, name: localName(node.tag), value: value)
+    return DavProp(ns: ns, name: localName(node.tag), value: value)
   var inner = ""
   for c in node.children:
     inner.add($c)
-  DavProp(ns: DavNs, name: localName(node.tag), xml: inner)
+  DavProp(ns: ns, name: localName(node.tag), xml: inner)
 
 proc parseFragment*(xmlStr: string): seq[XmlNode] =
   ## Parse an inner-XML fragment into nodes, graftable into a builder DOM.
@@ -242,6 +242,45 @@ func hasCalNs*(node: XmlNode): bool =
 proc davDoc*(root: XmlNode): string =
   ## Serialize a DAV response document with XML declaration.
   "<?xml version=\"1.0\" encoding=\"utf-8\"?>" & $root
+
+proc propstatCode*(status: string): int =
+  ## Numeric code from a propstat status line (`HTTP/1.1 200 OK` -> 200),
+  ## or 0 when the line does not parse.
+  let parts = status.split(' ')
+  if parts.len >= 2:
+    try:
+      return parseInt(parts[1])
+    except ValueError:
+      discard
+  0
+
+proc propNs(prefix: string): string {.inline.} =
+  case prefix
+  of "D": DavNs
+  of "C": CalNs
+  else: ""
+
+proc parseMultistatus*(body: string): seq[DavResponse] =
+  ## Parse a `207` multistatus body into responses. `D:`/`C:` prefixes map
+  ## to `DavNs`/`CalNs`; any other (or missing) prefix yields `ns == ""`,
+  ## since the server serializes foreign-namespace dead props bare.
+  ## Raises `DavXmlError` on any failure.
+  let root = parseDavXml(body).requireDavRoot("multistatus")
+  for resp in root.childrenByLocal("response"):
+    var r = DavResponse(href: resp.childText("href"))
+    for ps in resp.childrenByLocal("propstat"):
+      var stat = DavPropstat(status: ps.childText("status"))
+      let prop = ps.findChild("prop")
+      if prop != nil:
+        for e in prop.elementChildren():
+          let tag = e.tag
+          let ci = tag.rfind(':')
+          if ci < 0:
+            stat.props.add(parsePropValue(e, ""))
+          else:
+            stat.props.add(parsePropValue(e, propNs(tag[0 ..< ci])))
+      r.propstats.add(stat)
+    result.add(r)
 
 proc buildMultistatus*(responses: seq[DavResponse]): string =
   ## Build a `<D:multistatus>` 207 body. Text content is XML-escaped by the

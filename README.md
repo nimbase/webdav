@@ -60,6 +60,17 @@ enums, so `powpow` itself stays generic.
   `MemoryDriver` for tests)
 - Single-loop friendly: lazy lock expiry, no background threads
 
+**Client (RFC 4918 + CalDAV reports)**
+
+- `DavClient` over powpow's sync `HttpClient`: one helper per verb
+  (`propfind`, `proppatch`, `mkcol`, `mkcalendar`, `copy`, `move`,
+  `lock`, `unlock`, `report`, plus plain `get`/`put`/`delete`)
+- Request builders (`buildPropertyupdate`, `buildLockinfo`,
+  `buildCalendarQuery`, `buildCalendarMultiget`) that round-trip through
+  the server parsers
+- Response helpers: `multistatus` parsing into `DavResponse`s,
+  `propstatCode`, `lockTokenOf`, `ensure` for status assertions
+
 ## Examples
 
 ### Run the example server
@@ -115,6 +126,22 @@ newHttpServer().start(srv.davHandler(), Port(9001))
 Use `newMemoryDriver()` instead of `newLocalDriver()` for tests (see
 `tests/t_server_mem.nim` for the loopback pattern).
 
+### Use the client
+
+```nim
+import webdav
+
+let dav = newDavClient("http://localhost:9001")
+dav.mkcalendar("/cal").ensure(Http201)
+dav.put("/cal/ev.ics", readFile("ev.ics")).ensure(Http201)
+let found = dav.report("/cal",
+  buildCalendarQuery("VEVENT", "20260105T000000Z", "20260106T000000Z"),
+  ).multistatus()
+for r in found:
+  echo r.href
+dav.closeClient()
+```
+
 ## Modules
 
 | Module | Job |
@@ -127,6 +154,7 @@ Use `newMemoryDriver()` instead of `newLocalDriver()` for tests (see
 | `webdav/locks` | Lock manager, `Timeout`/`If` parsing |
 | `webdav/caldav` | REPORT parsing, time-range + recurrence matching |
 | `webdav/server` | Request router (`DavServer`, `davHandler`) |
+| `webdav/client` | Sync client (`DavClient`, builders, response helpers) |
 
 ## Tests
 
@@ -136,9 +164,10 @@ clue build tests/t_davxml.nim     --out:/tmp/t_davxml     && /tmp/t_davxml
 clue build tests/t_locks.nim      --out:/tmp/t_locks      && /tmp/t_locks
 clue build tests/t_server_mem.nim --out:/tmp/t_server_mem && /tmp/t_server_mem
 clue build tests/t_caldav.nim     --out:/tmp/t_caldav     && /tmp/t_caldav
+clue build tests/t_client.nim     --out:/tmp/t_client     && /tmp/t_client
 ```
 
-61 checks total across unit suites and loopback servers (in-memory backend
+70 checks total across unit suites and loopback servers (in-memory backend
 plus live curl runs against the disk-backed example).
 
 ## Known limits
@@ -153,7 +182,7 @@ plus live curl runs against the disk-backed example).
 
 ## Roadmap
 
-- [ ] WebDAV client to match the server
+- [x] WebDAV client to match the server
 - [ ] CardDAV (blocked upstream: `openparser` has no vCard parser yet)
 - [ ] CalDAV scheduling and `free-busy-query` REPORTs
 - [ ] Auth + principal collections (`calendar-home-set`, `current-user-principal`)
