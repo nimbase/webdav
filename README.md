@@ -27,66 +27,54 @@ enums, so `powpow` itself stays generic.
 
 ## Features
 
-**WebDAV Class 1 (RFC 4918)**
+**General**
 
-- `OPTIONS` (advertises `DAV: 1, 2`), `GET`, `HEAD`, `PUT`, `DELETE`
-- `MKCOL`, `PROPFIND` (`allprop`/`propname`/`prop`), best-effort `PROPPATCH`
-- `COPY` / `MOVE` with `Destination` + `Overwrite` handling
-- Live properties (`resourcetype`, `getetag`, `getcontentlength`,
-  `displayname`, `getlastmodified`, ...) and namespaced dead properties
-  that round-trip and travel across `COPY`/`MOVE`
-- Hardened XML input (depth and node caps, `422` on malformed bodies)
+- Built on PowPow, a fast event-driven networking library, so one process
+  serves many clients at once without threads
+- Quick downloads through zero-copy file serving
+- Storage through Flysystem: sandboxed to its own folder, crash-safe writes,
+  and ready for new backends such as cloud disks
+- Calendars and contacts parsed with OpenParser, in the standard iCalendar
+  and vCard formats
+- Runs on Linux, macOS and Windows
 
-**WebDAV Class 2 locking (RFC 4918)**
+**File sharing**
 
-- `LOCK` / `UNLOCK` with exclusive and shared scopes, depth `0`/`infinity`
-- `Timeout`, `Lock-Token`, and an `If` header subset (untagged + tagged
-  groups, `Not`)
-- `423 Locked` enforcement on modifying methods, live `lockdiscovery`
+- Upload, download, copy, move and delete files and folders
+- Folder listings with file details like size, type and modification time
+- Custom metadata that sticks to files, even across copy and move
+- Malformed requests are rejected safely
 
-**CalDAV core (RFC 4791)**
+**File locking**
 
-- `MKCALENDAR` with optional `<set><prop>` defaults
-- `REPORT` `calendar-query` (comp-filter + `time-range`) and
-  `calendar-multiget`, returning `getetag` + `calendar-data`
-- Recurrence expansion subset (`DAILY`/`WEEKLY`/`MONTHLY`/`YEARLY`,
-  `INTERVAL`, `COUNT`, `UNTIL`, weekly `BYDAY`, `EXDATE`)
-- `PUT` gate: resources inside a calendar must hold iCalendar object data
-- `getctag` change tags and `supported-report-set` on calendars
+- Lock files so concurrent edits do not overwrite each other
+- Shared and exclusive locks, with timeouts and tokens
+- Locked files refuse changes until they are unlocked
 
-**CardDAV core (RFC 6352)**
+**Calendars**
 
-- Extended `MKCOL` with `<resourcetype><collection/><addressbook/></resourcetype>`
-  creates addressbook collections (plain `MKCOL` unchanged, `415` for other bodies)
-- `REPORT` `addressbook-query` (`prop-filter` + `param-filter` + `text-match` +
-  `is-not-defined`, `test="anyof|allof"`, `negate-condition`, `limit/nresults`),
-  `addressbook-multiget`, and `sync-collection` (RFC 6578, ctag-based tokens),
-  returning `getetag` + `address-data`
-- `address-data` negotiation: `version="3.0"` downgrades via openparser,
-  other `content-type` than `text/vcard` answers `415`
-- `PUT`/`COPY`/`MOVE` gates: exactly one vCard per resource, UID uniqueness
-  (`409` on reuse or UID change)
-- `getctag` change tags, `supported-report-set` and `supported-address-data`
-  on addressbooks, `addressbook-description` dead-prop default via extended `MKCOL`
-- `GET` on `.vcf` serves `text/vcard`
+- Host calendars with events
+- Search events by type and time range, fetch many at once
+- Recurring events: daily, weekly, monthly and yearly
+- Only valid calendar data gets stored
+
+**Contacts**
+
+- Host address books with contacts
+- Search with field filters and text matching
+- Sync support, so clients fetch only what changed
+- One contact per file, duplicates rejected
+- Standard vCard download format
 
 **Plumbing**
 
-- Any flysystem `StorageDriver` backend (`LocalDriver` on disk,
-  `MemoryDriver` for tests)
-- Single-loop friendly: lazy lock expiry, no background threads
+- Any storage backend works, disk included, in-memory for tests
+- No background threads, friendly to a single event loop
 
-**Client (RFC 4918 + CalDAV/CardDAV reports)**
+**Client library**
 
-- `DavClient` over powpow's sync `HttpClient`: one helper per verb
-  (`propfind`, `proppatch`, `mkcol`, `mkcolAddressbook`, `mkcalendar`, `copy`,
-  `move`, `lock`, `unlock`, `report`, plus plain `get`/`put`/`delete`)
-- Request builders (`buildPropertyupdate`, `buildLockinfo`,
-  `buildCalendarQuery`, `buildCalendarMultiget`, `buildAddressbookQuery`,
-  `buildAddressbookMultiget`, `buildMkcolAddressbook`, `buildSyncCollection`)
-  that round-trip through the server parsers
-- Response helpers: `multistatus` parsing into `DavResponse`s,
-  `syncTokenOf`, `propstatCode`, `lockTokenOf`, `ensure` for status assertions
+- One helper per operation, for files, calendars and contacts
+- Helpers to build requests and read responses
 
 ## Examples
 
@@ -101,13 +89,18 @@ clue build examples/dav_server.nim --out:bin/dav_server
 
 ```sh
 clue build                        # drops the server binary in bin/
-./bin/webdav --root=./davroot --port=9001 --address=127.0.0.1
-./bin/webdav --config=dav.toml    # TOML file; explicit flags override it
-./bin/webdav --help               # full option list (via cligen)
+./bin/webdav init                 # writes webdav.config.toml with defaults
+./bin/webdav init --force         # overwrite an existing config file
+./bin/webdav serve                # picks up ./webdav.config.toml when present
+./bin/webdav serve --root=./davroot --port=9001 --address=127.0.0.1
+./bin/webdav serve --config=webdav.config.toml  # explicit flags override it
+./bin/webdav --help               # full help, flags and version (via kapsis)
+./bin/webdav serve                # no options, no config file: error, exit 1
 ```
 
+`webdav.config.toml` (all keys optional, as written by `init`):
+
 ```toml
-# dav.toml (all keys optional, defaults as above)
 root = "./davroot"
 port = 9001
 address = "127.0.0.1"

@@ -75,3 +75,39 @@ address = "0.0.0.0"
     expect ValueError:
       discard resolveConfig(DavFlags(config: p))
     removeFile(p)
+
+suite "cli init":
+  test "writes defaults that load back unchanged":
+    let p = getTempDir() / "davcli-init.toml"
+    removeFile(p)
+    initConfigFile(p)
+    let c = loadConfig(p)
+    check c.root == "./davroot"
+    check c.port == 9001
+    check c.address == "127.0.0.1"
+    removeFile(p)
+
+  test "refuses to overwrite without --force":
+    let p = tmpToml("davcli-init-guard.toml", "port = 1234\n")
+    expect IOError:
+      initConfigFile(p)
+    check loadConfig(p).port == 1234
+    initConfigFile(p, force = true)
+    check loadConfig(p).port == 9001
+    removeFile(p)
+
+  test "auto-load finds webdav.config.toml in the cwd":
+    let dir = getTempDir() / "davcli-autodir"
+    createDir(dir)
+    let saved = getCurrentDir()
+    setCurrentDir(dir)
+    try:
+      check autoConfigPath() == ""
+      initConfigFile()
+      check autoConfigPath() == expandFilename(dir / defaultConfigName)
+      let c = resolveConfig(DavFlags(config: autoConfigPath()))
+      check c.port == 9001
+    finally:
+      setCurrentDir(saved)
+    removeFile(dir / defaultConfigName)
+    removeDir(dir)

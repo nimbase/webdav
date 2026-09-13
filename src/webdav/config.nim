@@ -22,9 +22,35 @@ type
     address*: string
     config*: string
 
+const defaultConfigName* = "webdav.config.toml"
+  ## File `webdav init` writes and `webdav serve` auto-loads from the cwd.
+
 proc defaultDavConfig*(): DavConfig =
   DavConfig(root: getCurrentDir() / "davroot", port: 9001,
     address: "127.0.0.1")
+
+proc defaultConfigToml*(): string =
+  ## Defaults rendered as TOML: what `webdav init` writes to disk.
+  # `root` stays relative so the file works wherever the project lives.
+  """# webdav server config - created by `webdav init`.
+# CLI flags override these values; see `webdav serve --help`.
+root = "./davroot"
+port = 9001
+address = "127.0.0.1"
+"""
+
+proc initConfigFile*(path = defaultConfigName, force = false) =
+  ## Write defaults to `path`; refuse to overwrite unless `force`.
+  if fileExists(path) and not force:
+    raise newException(IOError, "Config file `" & path &
+      "` already exists (use --force to overwrite)")
+  writeFile(path, defaultConfigToml())
+
+proc autoConfigPath*(): string =
+  ## `webdav.config.toml` in the cwd when present, else "".
+  result = getCurrentDir() / defaultConfigName
+  if not fileExists(result):
+    result = ""
 
 proc loadConfig*(path: string): DavConfig =
   ## Built-in defaults overlaid with the TOML file at `path`.
